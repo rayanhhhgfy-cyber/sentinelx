@@ -34,7 +34,27 @@ async def run_scan(config: ScanConfig, on_finding=None, on_progress=None) -> lis
             on_progress(msg)
 
     async with ScanClient(config) as client:
+        # ---- per-module request stats (optional; web UI reads config.stats) ----
+        _mod_stats: dict[str, int] = {}
+        _active = {"module": "discovery"}
+        _orig_request = client.request
+
+        async def _tracked_request(method, url, **kw):
+            if config.stats is not None:
+                m = _active["module"]
+                _mod_stats[m] = _mod_stats.get(m, 0) + 1
+            return await _orig_request(method, url, **kw)
+
+        client.request = _tracked_request  # type: ignore[method-assign]
+
+        def _enabled(name: str) -> bool:
+            mods = config.modules or []
+            return not mods or name in mods
+
+        def _use_module(name: str):
+            _active["module"] = name
         # ---- WAF fingerprinting ----
+        _use_module("waf")
         progress("evasion: WAF fingerprinting")
         try:
             from sentinelx.evasion.fingerprint import fingerprint as waf_fp
@@ -45,6 +65,7 @@ async def run_scan(config: ScanConfig, on_finding=None, on_progress=None) -> lis
             pass
 
         # ---- discovery ----
+        _use_module("discovery")
         progress("discovery: crawling")
         crawler = Crawler(client, config)
         endpoints = await crawler.run()
@@ -53,43 +74,59 @@ async def run_scan(config: ScanConfig, on_finding=None, on_progress=None) -> lis
         target = config.target
 
         # ---- passive audits on the main URL ----
-        for f in await audit.scan_headers(client, config, target): emit(f)
-        for f in await audit.scan_cookies(client, config, target): emit(f)
-        for f in await audit.scan_cors(client, config, target): emit(f)
-        for f in await audit.scan_methods(client, config, target): emit(f)
+        _use_module("audit")
+        if _enabled("audit"):
+            for f in await audit.scan_headers(client, config, target): emit(f)
+            for f in await audit.scan_cookies(client, config, target): emit(f)
+            for f in await audit.scan_cors(client, config, target): emit(f)
+            for f in await audit.scan_methods(client, config, target): emit(f)
         progress("audit: headers/cookies/cors/methods done")
 
         # ---- directory bruteforce ----
-        for f in await probe.scan_dirfuzz(client, config, target): emit(f)
+        _use_module("dirfuzz")
+        if _enabled("dirfuzz"):
+            for f in await probe.scan_dirfuzz(client, config, target): emit(f)
         progress("probe: directory bruteforce done")
 
         # ---- JWT tests (token extraction + attacks) ----
         progress("modules: JWT analysis")
+        _use_module("jwt")
         try:
-            for f in await jwt.scan_endpoint(client, config, "GET", target, {}): emit(f)
+            if _enabled("jwt"):
+                for f in await jwt.scan_endpoint(client, config, "GET", target, {}): emit(f)
         except Exception:
             pass
 
         # ---- broken access control (forced browsing) ----
         progress("modules: broken access control")
+        _use_module("bac")
         try:
-            for f in await bac.scan_target(client, config, target): emit(f)
+            if _enabled("bac"):
+                for f in await bac.scan_target(client, config, target): emit(f)
         except Exception:
             pass
 
         # ---- secrets + tech fingerprinting + graphql ----
         progress("modules: secrets / tech / graphql")
+        _use_module("secrets")
         try:
-            for f in await secrets_mod.scan_page(client, config, target): emit(f)
-            for f in await techfp.fingerprint(client, config, target): emit(f)
-            for f in await graphql.scan_endpoint(client, config, "GET", target, {}): emit(f)
+            if _enabled("secrets"):
+                for f in await secrets_mod.scan_page(client, config, target): emit(f)
+            _use_module("techfp")
+            if _enabled("techfp"):
+                for f in await techfp.fingerprint(client, config, target): emit(f)
+            _use_module("graphql")
+            if _enabled("graphql"):
+                for f in await graphql.scan_endpoint(client, config, "GET", target, {}): emit(f)
         except Exception:
             pass
 
         # ---- HTTP request smuggling (raw socket, timing-safe) ----
         progress("modules: request smuggling")
+        _use_module("smuggling")
         try:
-            for f in await smuggling.scan_target(client, config, target): emit(f)
+            if _enabled("smuggling"):
+                for f in await smuggling.scan_target(client, config, target): emit(f)
         except Exception:
             pass
 
@@ -99,22 +136,38 @@ async def run_scan(config: ScanConfig, on_finding=None, on_progress=None) -> lis
         async def scan_ep(ep: Endpoint):
             async with sem:
                 try:
-                    for f in await sqli.scan_endpoint(
-                            client, config, ep.method, ep.url, ep.params): emit(f)
-                    for f in await xss.scan_endpoint(
-                            client, config, ep.method, ep.url, ep.params): emit(f)
-                    for f in await probe.scan_openredirect(
-                            client, config, ep.method, ep.url, ep.params): emit(f)
-                    for f in await lfi.scan_endpoint(
-                            client, config, ep.method, ep.url, ep.params): emit(f)
-                    for f in await ssrf.scan_endpoint(
-                            client, config, ep.method, ep.url, ep.params): emit(f)
-                    for f in await rce.scan_endpoint(
-                            client, config, ep.method, ep.url, ep.params): emit(f)
-                    for f in await idor.scan_endpoint(
-                            client, config, ep.method, ep.url, ep.params): emit(f)
-                    for f in await csrf.scan_endpoint(
-                            client, config, ep.method, ep.url, ep.params): emit(f)
+                    _use_module("sqli")
+                    if _enabled("sqli"):
+                        for f in await sqli.scan_endpoint(
+                                client, config, ep.method, ep.url, ep.params): emit(f)
+                    _use_module("xss")
+                    if _enabled("xss"):
+                        for f in await xss.scan_endpoint(
+                                client, config, ep.method, ep.url, ep.params): emit(f)
+                    _use_module("openredirect")
+                    if _enabled("openredirect"):
+                        for f in await probe.scan_openredirect(
+                                client, config, ep.method, ep.url, ep.params): emit(f)
+                    _use_module("lfi")
+                    if _enabled("lfi"):
+                        for f in await lfi.scan_endpoint(
+                                client, config, ep.method, ep.url, ep.params): emit(f)
+                    _use_module("ssrf")
+                    if _enabled("ssrf"):
+                        for f in await ssrf.scan_endpoint(
+                                client, config, ep.method, ep.url, ep.params): emit(f)
+                    _use_module("rce")
+                    if _enabled("rce"):
+                        for f in await rce.scan_endpoint(
+                                client, config, ep.method, ep.url, ep.params): emit(f)
+                    _use_module("idor")
+                    if _enabled("idor"):
+                        for f in await idor.scan_endpoint(
+                                client, config, ep.method, ep.url, ep.params): emit(f)
+                    _use_module("csrf")
+                    if _enabled("csrf"):
+                        for f in await csrf.scan_endpoint(
+                                client, config, ep.method, ep.url, ep.params): emit(f)
                 except Exception:
                     pass
 
@@ -128,6 +181,10 @@ async def run_scan(config: ScanConfig, on_finding=None, on_progress=None) -> lis
         progress(f"modules: scanning {len(all_eps)} endpoints")
         await asyncio.gather(*[scan_ep(ep) for ep in all_eps])
         progress(f"done: {len(findings)} findings, {client.requests_made} requests")
+
+    if config.stats is not None:
+        config.stats["modules"] = dict(_mod_stats)
+        config.stats["total_requests"] = client.requests_made
 
     # ---- AI brain: chain findings (heuristic, works without API keys) ----
     try:
