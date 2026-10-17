@@ -41,6 +41,9 @@ DB_ERRORS = [
     # SQLite
     (r"SQLite/JDBCDriver", "SQLite"), (r"SQLite\.Exception", "SQLite"),
     (r"System\.Data\.SQLite", "SQLite"), (r"Warning.*sqlite_.*", "SQLite"),
+    (r"sqlite3\.", "SQLite"),  # python sqlite3 module errors
+    (r"\bnear\s+.+:\s*syntax error", "SQLite"),  # python: near "'": syntax error
+    (r"no such (table|column)\b", "SQLite"),
     # Generic / others
     (r"SQLSTATE", "Generic SQL"), (r"Syntax error.*SQL", "Generic SQL"),
     (r"Unclosed quotation mark", "MSSQL"),

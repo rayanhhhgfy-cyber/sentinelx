@@ -42,7 +42,7 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern, bool]] = [
     ("JWT token",
      re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), False),
     ("Generic API key assignment",
-     re.compile(r"(?i)\b(api[_-]?key|apikey)\b\s*[:=]\s*['\"]([A-Za-z0-9\-_.]{16,})['\"]"), False),
+     re.compile(r"(?i)(?:\b|_)(api[_-]?key|apikey)\b\s*[:=]\s*['\"]([A-Za-z0-9\-_.]{16,})['\"]"), False),
     ("Password assignment",
      re.compile(r"(?i)\b(password|passwd|pwd)\b\s*[:=]\s*['\"]([^'\"\s]{6,})['\"]"), False),
     ("Heroku API key",
