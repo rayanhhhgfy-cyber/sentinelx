@@ -66,11 +66,35 @@ class _LinkParser(HTMLParser):
             self._form = None
 
 
+# skip static assets and logout URLs (never useful for vuln scanning)
+SKIP_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+    ".css", ".js", ".map", ".woff", ".woff2", ".ttf", ".eot",
+    ".mp4", ".webm", ".mp3", ".wav", ".pdf", ".zip",
+}
+SKIP_PATTERNS = [
+    re.compile(r"/logout|/signout|/logoff", re.I),
+    re.compile(r"\.(jpg|jpeg|png|gif|webp|svg|ico|css|woff2?|ttf|eot|mp4|webm|mp3|wav|pdf|zip)(\?|$)", re.I),
+]
+
+
+def should_skip(url: str) -> bool:
+    """Skip static assets and logout URLs."""
+    for pat in SKIP_PATTERNS:
+        if pat.search(url):
+            return True
+    return False
+
+
+# enhanced JS endpoint patterns: fetch(, axios, /api/ paths
 JS_ENDPOINT_RE = re.compile(
     r"""(?:"|')((?:/|\./|https?://)[a-zA-Z0-9_\-./?=&%#]+)(?:"|')"""
 )
 FETCH_RE = re.compile(
     r"""(?:fetch|axios\.(?:get|post|put|delete|patch)|\$\.ajax|open)\s*\(\s*["']([^"']+)["']""",
+)
+API_PATH_RE = re.compile(
+    r"""["']((?:/api/|/v\d+/|/rest/)[a-zA-Z0-9_\-./?=&%{}]+)["']"""
 )
 
 
@@ -80,9 +104,12 @@ def extract_js_endpoints(js_text: str, base_url: str) -> set[str]:
         out.add(urljoin(base_url, m.group(1)))
     for m in FETCH_RE.finditer(js_text):
         out.add(urljoin(base_url, m.group(1)))
+    for m in API_PATH_RE.finditer(js_text):
+        out.add(urljoin(base_url, m.group(1)))
     # only keep same-origin or path-absolute
     base_host = urlsplit(base_url).netloc
-    return {u for u in out if urlsplit(u).netloc in ("", base_host)}
+    return {u for u in out if urlsplit(u).netloc in ("", base_host)
+            and not should_skip(u)}
 
 
 def split_params(url: str) -> tuple[str, dict]:
@@ -165,20 +192,38 @@ class Crawler:
         return new_links
 
     async def run(self) -> list[Endpoint]:
+        max_pages = getattr(self.config, "max_pages", 50)
         await self.fetch_robots()
         queue: list[tuple[str, int]] = [(self.config.target, 0)]
-        while queue:
-            url, depth = queue.pop(0)
-            norm = url.split("#")[0]
-            if norm in self.visited or depth > self.config.crawl_depth:
-                continue
-            self.visited.add(norm)
-            try:
-                links = await self.crawl_page(norm, depth)
-            except Exception:
-                continue
-            if depth < self.config.crawl_depth:
-                for link in links:
-                    if link.split("#")[0] not in self.visited:
-                        queue.append((link, depth + 1))
+        # concurrent crawling bounded by semaphore (polite but fast)
+        sem = asyncio.Semaphore(10)
+
+        async def process(url: str, depth: int) -> list[str]:
+            async with sem:
+                try:
+                    return await self.crawl_page(url, depth)
+                except Exception:
+                    return []
+
+        while queue and len(self.visited) < max_pages:
+            # take a batch of URLs to process concurrently
+            batch = []
+            while queue and len(batch) < 10 and len(self.visited) + len(batch) < max_pages:
+                url, depth = queue.pop(0)
+                norm = url.split("#")[0]
+                if norm in self.visited or depth > self.config.crawl_depth:
+                    continue
+                if should_skip(norm):
+                    continue
+                self.visited.add(norm)
+                batch.append((norm, depth))
+            if not batch:
+                break
+            results = await asyncio.gather(*[process(u, d) for u, d in batch])
+            for (u, d), links in zip(batch, results):
+                if d < self.config.crawl_depth:
+                    for link in links:
+                        n = link.split("#")[0]
+                        if n not in self.visited and not should_skip(n):
+                            queue.append((link, d + 1))
         return list(self.endpoints.values())

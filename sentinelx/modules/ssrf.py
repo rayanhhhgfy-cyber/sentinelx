@@ -7,6 +7,7 @@ Detection via metadata markers, service banners, timing.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from urllib.parse import urlencode as _urlencode
@@ -77,41 +78,54 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     targets = urlish or list(params)[:2]
 
     for param in targets:
-        for payload in PAYLOADS:
-            p = dict(params); p[param] = payload
-            t0 = time.monotonic()
-            if method == "GET":
-                full = url + ("&" if "?" in url else "?") + _urlencode(p)
-                resp = await client.get(full)
-                body_sent = None
-            else:
-                resp = await client.post(url, data=p)
-                full, body_sent = url, _urlencode(p).encode()
-            elapsed = time.monotonic() - t0
-            if not resp:
-                continue
-            hit = None
-            # strip the reflected payload before matching: markers must come
-            # from server-side fetched content, not from our own reflected input
-            body_for_markers = resp.text.replace(payload, "")
-            for rx, label in MARKERS:
-                if rx.search(body_for_markers):
-                    hit = label
+        # batched concurrent payload testing (early exit on hit)
+        hit = None
+        for i in range(0, len(PAYLOADS), 15):
+            batch = PAYLOADS[i:i + 15]
+
+            async def try_payload(payload: str):
+                p = dict(params); p[param] = payload
+                t0 = time.monotonic()
+                if method == "GET":
+                    full = url + ("&" if "?" in url else "?") + _urlencode(p)
+                    resp = await client.get(full)
+                    body_sent = None
+                else:
+                    resp = await client.post(url, data=p)
+                    full, body_sent = url, _urlencode(p).encode()
+                elapsed = time.monotonic() - t0
+                if not resp:
+                    return None
+                # strip the reflected payload before matching: markers must come
+                # from server-side fetched content, not from our own reflected input
+                body_for_markers = resp.text.replace(payload, "")
+                for rx, label in MARKERS:
+                    if rx.search(body_for_markers):
+                        return (payload, full, body_sent, resp, label)
+                return None
+
+            results = await asyncio.gather(*[try_payload(pl) for pl in batch])
+            for r in results:
+                if r:
+                    hit = r
                     break
             if hit:
-                ev = Evidence(
-                    request_raw=raw_request(method, full, headers, body_sent),
-                    response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content),
-                    proof=f"SSRF indicator: {hit} reflected after probing {payload}",
-                )
-                findings.append(Finding(
-                    type="Server-Side Request Forgery", subtype="ssrf",
-                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N",
-                    confidence=0.88, url=full, method=method, param=param,
-                    payload=payload, evidence=ev, cwe="CWE-918",
-                    owasp="A10:2021 – SSRF",
-                    remediation=REMEDIATION_SSRF,
-                    references=["https://owasp.org/www-community/attacks/Server_Side_Request_Forgery"],
-                ))
                 break
+
+        if hit:
+            payload, full, body_sent, resp, label = hit
+            ev = Evidence(
+                request_raw=raw_request(method, full, headers, body_sent),
+                response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content),
+                proof=f"SSRF indicator: {label} reflected after probing {payload}",
+            )
+            findings.append(Finding(
+                type="Server-Side Request Forgery", subtype="ssrf",
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N",
+                confidence=0.88, url=full, method=method, param=param,
+                payload=payload, evidence=ev, cwe="CWE-918",
+                owasp="A10:2021 – SSRF",
+                remediation=REMEDIATION_SSRF,
+                references=["https://owasp.org/www-community/attacks/Server_Side_Request_Forgery"],
+            ))
     return findings

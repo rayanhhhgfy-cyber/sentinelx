@@ -87,6 +87,16 @@ async def scan_dirfuzz(client: ScanClient, config: ScanConfig, url: str) -> list
     base = urlsplit(url)
     root = f"{base.scheme}://{base.netloc}"
     headers = {"User-Agent": config.user_agent}
+
+    # soft-404 baseline: fetch a definitely-missing path to learn the 404 signature
+    soft404_len, soft404_body = 0, ""
+    try:
+        r404 = await client.get(f"{root}/sx-definitely-missing-987654321", headers=headers)
+        if r404:
+            soft404_len, soft404_body = len(r404.content), r404.text[:500]
+    except Exception:
+        pass
+
     sem = asyncio.Semaphore(20)
 
     async def probe(path: str):
@@ -97,12 +107,17 @@ async def scan_dirfuzz(client: ScanClient, config: ScanConfig, url: str) -> list
                 return
             # interesting: 200 with non-trivial body, or revealing status
             if resp.status_code == 200 and len(resp.content) > 100:
-                # filter out soft-404s: same length as base 404 page heuristic
+                # soft-404 filter: skip if body matches the 404 baseline
+                # (signal 1: status 200, signal 2: content differs from 404 page)
+                if soft404_len and abs(len(resp.content) - soft404_len) < 200:
+                    return
+                if soft404_body and soft404_body in resp.text[:500]:
+                    return
                 ev = Evidence(
                     request_raw=raw_request("GET", full, headers, None),
                     response_raw=raw_response(resp.status_code, dict(resp.headers),
                                               resp.content[:2000]),
-                    proof=f"HTTP 200, {len(resp.content)} bytes at /{path}",
+                    proof=f"HTTP 200, {len(resp.content)} bytes at /{path} (differs from 404 baseline)",
                 )
                 findings.append(Finding(
                     type="Sensitive Path Exposure", subtype=f"path:/{path}",

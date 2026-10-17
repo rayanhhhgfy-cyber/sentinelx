@@ -121,28 +121,28 @@ async def scan_target(client, config: ScanConfig, target: str) -> list[Finding]:
     if not host:
         return findings
 
-    # baseline: 3 clean requests
+    # baseline: 2 clean requests (was 3 — 2 samples suffice with tight thresholds)
     baseline_payload = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
                         f"Connection: close\r\n\r\n").encode()
     base_times = []
-    for _ in range(3):
+    for _ in range(2):
         _, el = await _raw_exchange(host, port, baseline_payload, use_tls)
         base_times.append(el)
-        await asyncio.sleep(1.0)  # rate limit: max ~1 probe/sec
     base_avg = sum(base_times) / len(base_times)
+    base_max = max(base_times)
 
     for name, payload in build_probes(host, path):
         probe_times, responses = [], []
-        for _ in range(3):
+        for _ in range(2):
             data, el = await _raw_exchange(host, port, payload, use_tls)
             probe_times.append(el)
             responses.append(data)
-            await asyncio.sleep(1.0)
         probe_avg = sum(probe_times) / len(probe_times)
 
         # detection 1: timing anomaly (desync causes backend to wait)
-        timing_hit = (probe_avg > base_avg + 5.0
-                      and all(t > base_avg + 4.0 for t in probe_times))
+        # adaptive: probe must exceed baseline max + 4s on ALL samples
+        timing_hit = (probe_avg > base_max + 4.0
+                      and all(t > base_max + 3.0 for t in probe_times))
         # detection 2: differential response (smuggled bytes leak into reply)
         # detection 3: status anomaly vs baseline
         base_resp, _ = await _raw_exchange(host, port, baseline_payload, use_tls)

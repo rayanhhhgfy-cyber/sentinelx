@@ -249,4 +249,45 @@ class AIBrain:
                                 "tokens to an attacker domain."),
                 "finding_ids": ids(redir),
             })
+        # SQLi -> chained attack suggestions (smart correlation)
+        sqli = has("sql injection") or has("sqli")
+        if sqli:
+            # group by param to suggest param-specific chains
+            params = {}
+            for f in sqli:
+                p = str(fget(f, "param", "")) or str(fget(f, "url", ""))
+                params.setdefault(p, []).append(f)
+            for param, items in params.items():
+                chains.append({
+                    "chain": f"SQLi on '{param}' → chained attacks",
+                    "description": (
+                        f"SQL injection confirmed on parameter '{param}'. "
+                        "Suggested follow-ups: (1) UNION-based data extraction "
+                        "via information_schema, (2) out-of-band exfiltration "
+                        "if stacked queries work, (3) privilege escalation via "
+                        "DB user enumeration, (4) RCE via INTO OUTFILE / "
+                        "xp_cmdshell if DB user has FILE/admin rights."
+                    ),
+                    "finding_ids": ids(items),
+                })
+        # SSTI -> RCE chain
+        ssti = has("template injection") or has("ssti")
+        if ssti:
+            chains.append({
+                "chain": "SSTI → RCE",
+                "description": ("Server-side template injection often leads to "
+                                "remote code execution via template engine "
+                                "namespaces (e.g., Jinja2 __class__ traversal)."),
+                "finding_ids": ids(ssti),
+            })
+        # XXE -> SSRF/file disclosure chain
+        xxe = has("xml external entity") or has("xxe")
+        if xxe:
+            chains.append({
+                "chain": "XXE → file disclosure / SSRF",
+                "description": ("XXE can pivot to local file disclosure "
+                                "(/etc/passwd) or SSRF against internal "
+                                "services via external entity URLs."),
+                "finding_ids": ids(xxe),
+            })
         return chains

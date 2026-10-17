@@ -14,14 +14,16 @@ from urllib.parse import urlencode as _urlencode
 
 from sentinelx.core.http import ScanClient, ScanConfig
 from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
+from sentinelx.core.baseline import get_baseline, adaptive_delay
 
 
 SEPARATORS = [";", "|", "||", "&&", "`", "$()", "%0a", "%0d", "\n"]
 
 TIME_CMDS = [
-    ("; sleep 5", 5), ("| sleep 5", 5), ("&& sleep 5", 5),
-    ("; /bin/sleep 5", 5), ("`sleep 5`", 5), ("$(sleep 5)", 5),
-    ("; ping -c 5 127.0.0.1", 5), ("; timeout 5", 5),
+    # (template, ) — delay computed adaptively via adaptive_delay(); {d} = seconds
+    "; sleep {d}", "| sleep {d}", "&& sleep {d}",
+    "; /bin/sleep {d}", "`sleep {d}`", "$(sleep {d})",
+    "; ping -c {d} 127.0.0.1", "; timeout {d}",
 ]
 OUTPUT_PAYLOADS = [
     ("; id", re.compile(r"uid=\d+.*gid=\d+")),
@@ -60,17 +62,17 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     targets = cmdish or list(params)[:2]
 
     for param in targets:
-        # baseline: 3 samples
-        base_times = []
-        for _ in range(3):
-            resp, _, _, el = await _send(client, method, url, params, param, params[param])
-            if resp is None:
-                break
-            base_times.append(el)
-        if len(base_times) < 3:
+        # shared baseline (fetched once per endpoint, reused by all modules)
+        bl = await get_baseline(client, method, url, params)
+        if not bl or not bl.stable:
             continue
-        base_avg = sum(base_times) / len(base_times)
-        base_max = max(base_times)
+        base_avg, base_max = bl.avg_time, bl.avg_time
+        delay = adaptive_delay(bl.avg_time)
+        # refine base_max with 2 extra samples for tight thresholding
+        for _ in range(2):
+            _, _, _, el = await _send(client, method, url, params, param, params[param])
+            base_max = max(base_max, el)
+        base_avg = bl.avg_time
 
         # 1. output-based
         for payload, rx in OUTPUT_PAYLOADS:
@@ -102,8 +104,9 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         if findings:
             continue
 
-        # 2. time-based with baseline subtraction
-        for payload, delay in TIME_CMDS:
+        # 2. time-based with baseline subtraction (adaptive delay)
+        for tmpl in TIME_CMDS:
+            payload = tmpl.format(d=int(delay))
             samples = []
             for _ in range(2):
                 resp, full, body_sent, el = await _send(

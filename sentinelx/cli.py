@@ -50,6 +50,8 @@ def parse_args(argv=None):
     p.add_argument("--auth-b", default="", help="bearer token for session B (IDOR)")
     p.add_argument("--webhook", default="", help="webhook URL for completion notification")
     p.add_argument("--webhook-kind", default="generic", choices=["slack", "discord", "generic"])
+    p.add_argument("--max-pages", type=int, default=50, help="max pages to crawl")
+    p.add_argument("--no-smart", action="store_true", help="disable smart mode (tech-tuned payloads, priority queue)")
     return p.parse_args(argv)
 
 
@@ -71,6 +73,7 @@ def main(argv=None) -> int:
         target=args.target, concurrency=args.concurrency,
         rate_per_sec=args.rate, crawl_depth=args.depth, timeout=args.timeout,
         oob_domain=args.oob_domain, auth_a=args.auth_a, auth_b=args.auth_b,
+        max_pages=args.max_pages, smart=not args.no_smart,
     )
     unsafe = args.unsafe
 

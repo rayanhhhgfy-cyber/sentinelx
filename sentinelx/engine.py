@@ -15,9 +15,13 @@ from urllib.parse import urlsplit
 
 from sentinelx.core.http import ScanClient, ScanConfig
 from sentinelx.core.models import Finding
+from sentinelx.core.baseline import Baseline, get_baseline as _get_baseline, adaptive_delay
 from sentinelx.discovery.crawler import Crawler, Endpoint
 from sentinelx.modules import sqli, xss, audit, probe, lfi, ssrf, rce, idor, jwt, csrf, bac, smuggling
 from sentinelx.modules import secrets as secrets_mod, techfp, graphql
+from sentinelx.modules import xxe, ssti, hostheader, cachepoison, deser
+from sentinelx.modules import ldap, xpath, header_rce, crlf, jsredirect
+from sentinelx.modules import takeover, clickjack, idor_api, jwt_adv, proto_pollute
 
 
 STAGES = [
@@ -29,6 +33,7 @@ STAGES = [
     "bac",            # broken access control
     "stg",            # secrets + tech fingerprinting + graphql
     "smuggling",      # HTTP request smuggling (raw sockets)
+    "target_extra",   # takeover + clickjack (target-level, once)
     "endpoints",      # per-endpoint active modules (cursor-based, chunkable)
     "finalize",       # AI brain chaining (no new findings)
 ]
@@ -68,6 +73,10 @@ class ScanCtx:
     def _enabled(self, name: str) -> bool:
         mods = self.config.modules or []
         return not mods or name in mods
+
+    async def get_baseline(self, method: str, url: str, params: dict) -> Baseline | None:
+        """Shared baseline via core/baseline.py (cached on client)."""
+        return await _get_baseline(self.client, method, url, params)
 
     def checkpoint(self) -> dict:
         return {
@@ -180,6 +189,12 @@ async def run_stage(ctx: ScanCtx, stage: str):
             if ctx._enabled("techfp"):
                 for f in await techfp.fingerprint(client, config, target):
                     ctx._emit(f)
+                    # smart mode: feed detected tech into config for payload tuning
+                    if config.smart and f.subtype:
+                        # subtype is like "tech:PHP" or the tech name
+                        tech = f.subtype.replace("tech:", "").strip()
+                        if tech:
+                            config.tech_stack.add(tech)
             ctx._use("graphql")
             if ctx._enabled("graphql"):
                 for f in await graphql.scan_endpoint(client, config, "GET", target, {}):
@@ -194,6 +209,17 @@ async def run_stage(ctx: ScanCtx, stage: str):
             if ctx._enabled("smuggling"):
                 for f in await smuggling.scan_target(client, config, target):
                     ctx._emit(f)
+        except Exception:
+            pass
+
+    elif stage == "target_extra":
+        ctx._progress("modules: target-level (takeover / clickjack / header_rce)")
+        try:
+            for mod_name, mod_fn in TARGET_MODULES:
+                if ctx._enabled(mod_name):
+                    ctx._use(mod_name)
+                    for f in await mod_fn(client, config, "GET", target, {}):
+                        ctx._emit(f)
         except Exception:
             pass
 
@@ -218,9 +244,12 @@ async def run_stage(ctx: ScanCtx, stage: str):
 
 async def run_endpoints_slice(ctx: ScanCtx, start_idx: int,
                               deadline: float | None,
-                              batch_size: int = 4) -> tuple[int, bool]:
+                              batch_size: int = 16) -> tuple[int, bool]:
     """Scan endpoints[start_idx:] in small batches. Returns (next_idx, done).
-    Stops early when deadline (monotonic seconds) is exceeded."""
+    Stops early when deadline (monotonic seconds) is exceeded.
+
+    Modules run CONCURRENTLY per endpoint (they're independent), bounded by
+    the client's request-level semaphore (config.concurrency)."""
     from sentinelx.discovery.crawler import split_params
 
     client, config = ctx.client, ctx.config
@@ -232,53 +261,57 @@ async def run_endpoints_slice(ctx: ScanCtx, start_idx: int,
     if params and not any(e["url"] == clean for e in eps):
         eps.append({"url": clean, "method": "GET", "params": params})
 
-    sem = asyncio.Semaphore(10)
+    # (module_name, scan_fn) — all independent, run concurrently
+    MODULES = [
+        ("sqli", sqli.scan_endpoint),
+        ("xss", xss.scan_endpoint),
+        ("openredirect", probe.scan_openredirect),
+        ("lfi", lfi.scan_endpoint),
+        ("ssrf", ssrf.scan_endpoint),
+        ("rce", rce.scan_endpoint),
+        ("idor", idor.scan_endpoint),
+        ("csrf", csrf.scan_endpoint),
+        ("xxe", xxe.scan_endpoint),
+        ("ssti", ssti.scan_endpoint),
+        ("hostheader", hostheader.scan_endpoint),
+        ("cachepoison", cachepoison.scan_endpoint),
+        ("deser", deser.scan_endpoint),
+        ("ldap", ldap.scan_endpoint),
+        ("xpath", xpath.scan_endpoint),
+        ("crlf", crlf.scan_endpoint),
+        ("jsredirect", jsredirect.scan_endpoint),
+        ("idor_api", idor_api.scan_endpoint),
+        ("jwt_adv", jwt_adv.scan_endpoint),
+        ("proto_pollute", proto_pollute.scan_endpoint),
+    ]
+    # target-level modules (run once on main URL, not per-endpoint)
+    TARGET_MODULES = [
+        ("takeover", takeover.scan_endpoint),
+        ("clickjack", clickjack.scan_endpoint),
+        ("header_rce", header_rce.scan_endpoint),
+    ]
+
+    async def run_mod(name: str, fn, ep: dict):
+        """Run one module on one endpoint, collecting its findings."""
+        if not ctx._enabled(name):
+            return []
+        try:
+            return await fn(client, config, ep["method"], ep["url"], ep["params"])
+        except Exception:
+            return []
 
     async def scan_ep(ep: dict):
-        async with sem:
-            try:
-                ctx._use("sqli")
-                if ctx._enabled("sqli"):
-                    for f in await sqli.scan_endpoint(
-                            client, config, ep["method"], ep["url"], ep["params"]):
-                        ctx._emit(f)
-                ctx._use("xss")
-                if ctx._enabled("xss"):
-                    for f in await xss.scan_endpoint(
-                            client, config, ep["method"], ep["url"], ep["params"]):
-                        ctx._emit(f)
-                ctx._use("openredirect")
-                if ctx._enabled("openredirect"):
-                    for f in await probe.scan_openredirect(
-                            client, config, ep["method"], ep["url"], ep["params"]):
-                        ctx._emit(f)
-                ctx._use("lfi")
-                if ctx._enabled("lfi"):
-                    for f in await lfi.scan_endpoint(
-                            client, config, ep["method"], ep["url"], ep["params"]):
-                        ctx._emit(f)
-                ctx._use("ssrf")
-                if ctx._enabled("ssrf"):
-                    for f in await ssrf.scan_endpoint(
-                            client, config, ep["method"], ep["url"], ep["params"]):
-                        ctx._emit(f)
-                ctx._use("rce")
-                if ctx._enabled("rce"):
-                    for f in await rce.scan_endpoint(
-                            client, config, ep["method"], ep["url"], ep["params"]):
-                        ctx._emit(f)
-                ctx._use("idor")
-                if ctx._enabled("idor"):
-                    for f in await idor.scan_endpoint(
-                            client, config, ep["method"], ep["url"], ep["params"]):
-                        ctx._emit(f)
-                ctx._use("csrf")
-                if ctx._enabled("csrf"):
-                    for f in await csrf.scan_endpoint(
-                            client, config, ep["method"], ep["url"], ep["params"]):
-                        ctx._emit(f)
-            except Exception:
-                pass
+        # pre-fetch shared baseline once per endpoint (modules reuse it)
+        if ep["params"]:
+            await ctx.get_baseline(ep["method"], ep["url"], ep["params"])
+        # run all modules concurrently — the client's semaphore bounds
+        # actual HTTP concurrency at config.concurrency
+        results = await asyncio.gather(*[
+            run_mod(name, fn, ep) for name, fn in MODULES
+        ])
+        for findings in results:
+            for f in findings:
+                ctx._emit(f)
 
     idx = start_idx
     total = len(eps)

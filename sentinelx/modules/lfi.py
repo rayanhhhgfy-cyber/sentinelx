@@ -13,6 +13,8 @@ from urllib.parse import urlencode as _urlencode, quote
 
 from sentinelx.core.http import ScanClient, ScanConfig
 from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
+from sentinelx.core.baseline import get_baseline
+import asyncio
 
 
 LINUX_FILES = [
@@ -120,42 +122,53 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     targets = fileish or list(params)[:2]
 
     for param in targets:
-        # baseline to avoid flagging pages that already contain signatures
-        p0 = dict(params)
-        if method == "GET":
-            base_url = url + ("&" if "?" in url else "?") + _urlencode(p0)
-            base_resp = await client.get(base_url)
-        else:
-            base_resp = await client.post(url, data=p0)
-            base_url = url
-        base_sig = detect_lfi(base_resp.text) if base_resp else None
+        # shared baseline (avoids flagging pages that already contain signatures)
+        bl = await get_baseline(client, method, url, params)
+        base_sig = detect_lfi(bl.body) if bl else None
 
-        for payload in PAYLOADS:
-            p = dict(params); p[param] = payload
-            if method == "GET":
-                full = url + ("&" if "?" in url else "?") + _urlencode(p)
-                resp = await client.get(full)
-                body_sent = None
-            else:
-                resp = await client.post(url, data=p)
-                full, body_sent = url, _urlencode(p).encode()
-            if not resp:
-                continue
-            sig = detect_lfi(resp.text)
-            if sig and sig != base_sig:
-                ev = Evidence(
-                    request_raw=raw_request(method, full, headers, body_sent),
-                    response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content),
-                    proof=f"File content signature detected: {sig}",
-                )
-                findings.append(Finding(
-                    type="Path Traversal", subtype="local-file-inclusion",
-                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
-                    confidence=0.93, url=full, method=method, param=param,
-                    payload=payload, evidence=ev, cwe="CWE-22",
-                    owasp="A01:2021 – Broken Access Control",
-                    remediation=REMEDIATION_LFI,
-                    references=["https://owasp.org/www-community/attacks/Path_Traversal"],
-                ))
+        # batched concurrent payload testing (early exit on hit)
+        hit = None
+        for i in range(0, len(PAYLOADS), 20):
+            batch = PAYLOADS[i:i + 20]
+
+            async def try_payload(payload: str):
+                p = dict(params); p[param] = payload
+                if method == "GET":
+                    full = url + ("&" if "?" in url else "?") + _urlencode(p)
+                    resp = await client.get(full)
+                    body_sent = None
+                else:
+                    resp = await client.post(url, data=p)
+                    full, body_sent = url, _urlencode(p).encode()
+                if not resp:
+                    return None
+                sig = detect_lfi(resp.text)
+                if sig and sig != base_sig:
+                    return (payload, full, body_sent, resp, sig)
+                return None
+
+            results = await asyncio.gather(*[try_payload(pl) for pl in batch])
+            for r in results:
+                if r:
+                    hit = r
+                    break
+            if hit:
                 break
+
+        if hit:
+            payload, full, body_sent, resp, sig = hit
+            ev = Evidence(
+                request_raw=raw_request(method, full, headers, body_sent),
+                response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content),
+                proof=f"File content signature detected: {sig}",
+            )
+            findings.append(Finding(
+                type="Path Traversal", subtype="local-file-inclusion",
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+                confidence=0.93, url=full, method=method, param=param,
+                payload=payload, evidence=ev, cwe="CWE-22",
+                owasp="A01:2021 – Broken Access Control",
+                remediation=REMEDIATION_LFI,
+                references=["https://owasp.org/www-community/attacks/Path_Traversal"],
+            ))
     return findings
