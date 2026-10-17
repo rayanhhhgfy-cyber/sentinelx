@@ -17,7 +17,7 @@ Legend: [ ] = not yet verified · [✓] = verified working after changes
 | 6 | `crlf.py` | `scan_endpoint` | CRLF injection / HTTP response splitting | [~] |
 | 7 | `csrf.py` | `scan_endpoint` | Cross-site request forgery (missing/invalid tokens) | [~] |
 | 8 | `deser.py` | `scan_endpoint` | Insecure deserialization | [~] |
-| 9 | `domxss.py` | `scan_endpoint` | DOM-based XSS (now js2py-powered) | [✓] |
+| 9 | `domxss.py` | `scan_endpoint` | DOM-based XSS (now node-powered) | [✓] |
 | 10 | `graphql.py` | `scan_endpoint` | GraphQL introspection, query abuse | [~] |
 | 11 | `header_rce.py` | `scan_endpoint` | Command injection via HTTP headers (User-Agent, Referer, X-Forwarded-For) | [~] |
 | 12 | `hostheader.py` | `scan_endpoint` | Host header injection (password-reset poisoning, cache poisoning) | [~] |
@@ -53,7 +53,7 @@ Legend: [ ] = not yet verified · [✓] = verified working after changes
 | 2026-10-17 | sqli, xss, audit, ssrf | targeted scan vs target/app.py → 36 findings | PASS |
 | 2026-10-17 | models.Finding | backward compat (legacy confidence float) + new levels | PASS |
 | 2026-10-17 | jsruntime | 22/22 unit tests (mock, executor, taint, instrument) | PASS |
-| 2026-10-17 | cli | clean error when js2py hidden; normal start when present | PASS |
+| 2026-10-17 | cli | clean error when node missing; normal start when present | PASS |
 
 ## Status key
 - [✓] = verified working (import + functional test)

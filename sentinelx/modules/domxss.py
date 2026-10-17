@@ -1,6 +1,6 @@
 """SentinelX module [35]: DOM-based XSS via real JavaScript execution.
 
-Powered by sentinelx.jsruntime (js2py — real ECMAScript 5.1 engine).
+Powered by sentinelx.jsruntime (node.js — real V8 JavaScript engine).
 Page <script> blocks are EXECUTED inside the virtual browser.
 location.hash / location.search are seeded with unique taint canaries;
 the instrumented environment records every sink hit. When a canary
@@ -120,7 +120,7 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
             continue
         score, sinks, sources = score_js_interest(js)
         if score > 0:
-            interesting.append((score, js, sinks))
+            interesting.append((score, js, sinks, sources))
     if not interesting:
         return findings
     interesting.sort(key=lambda x: -x[0])
@@ -132,7 +132,7 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     search_mark = tracker.new_mark(taint_mod.Source.QUERY, "location.search")
 
     seen: set[tuple] = set()
-    for score, js, static_sinks in interesting:
+    for score, js, static_sinks, static_sources in interesting:
         result = execute(
             js, page_url=url,
             hash_canary=hash_mark.canary, search_canary=search_mark.canary,
@@ -160,7 +160,7 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 response_raw=raw_response(resp.status_code, dict(resp.headers),
                                           resp.content[:1500]),
                 proof=(
-                    f"DOM XSS CONFIRMED by real JS execution (js2py): tainted "
+                    f"DOM XSS CONFIRMED by real JS execution (node): tainted "
                     f"data from {flow.source}({flow.source_id}) reached "
                     f"{flow.sink}. Sink received: {flow.evidence[:220]}"
                 ),
@@ -192,8 +192,10 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
             findings.append(f)
 
         # MEDIUM: dangerous sink executed at runtime, no canary flow proven.
-        # Only report once per sink kind per page to avoid noise.
-        if cf.confidence == "MEDIUM":
+        # Only report once per sink kind per page, and ONLY when the script
+        # statically references attacker-controlled sources (e.g. reads
+        # location.hash). A sink fed purely static content is not a finding.
+        if cf.confidence == "MEDIUM" and static_sources:
             for e in result.dom_writes + result.eval_calls:
                 kind = str(e.get("kind", ""))
                 if kind not in DANGEROUS_SINKS:
