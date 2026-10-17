@@ -27,37 +27,37 @@ export default function Auth() {
         <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-500 shadow-lg shadow-indigo-500/30 mb-6">
           <Shield className="h-7 w-7 text-white" strokeWidth={2.2} />
         </div>
-        <h1 className="text-2xl font-extrabold text-slate-900 tracking-tight">
+        <h1 className="text-2xl font-extrabold text-slate-900 dark:text-white tracking-tight">
           {mode === "login" ? "Welcome back" : "Create your account"}
         </h1>
-        <p className="mt-1.5 text-sm text-slate-500">
+        <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
           {mode === "login" ? "Sign in to run scans and review findings." : "Join SentinelX and start scanning in seconds."}
         </p>
         <form onSubmit={submit} className="mt-7 space-y-4">
           {mode === "register" && (
             <label className="block">
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">Name</span>
+              <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Name</span>
               <div className="relative mt-1.5">
-                <User className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4.5 w-4.5 h-5 w-5 text-slate-400" />
+                <User className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4.5 w-4.5 h-5 w-5 text-slate-400 dark:text-slate-500" />
                 <input value={name} onChange={e => setName(e.target.value)} required placeholder="Ada Lovelace"
-                  className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 border border-slate-200 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all" />
+                  className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-900 dark:text-white placeholder:text-slate-400 dark:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all" />
               </div>
             </label>
           )}
           <label className="block">
-            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">Email</span>
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Email</span>
             <div className="relative mt-1.5">
-              <Mail className="absolute left-3.5 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
+              <Mail className="absolute left-3.5 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400 dark:text-slate-500" />
               <input type="email" value={email} onChange={e => setEmail(e.target.value)} required placeholder="you@example.com"
-                className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 border border-slate-200 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all" />
+                className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-900 dark:text-white placeholder:text-slate-400 dark:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all" />
             </div>
           </label>
           <label className="block">
-            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">Password</span>
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Password</span>
             <div className="relative mt-1.5">
-              <KeyRound className="absolute left-3.5 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
+              <KeyRound className="absolute left-3.5 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400 dark:text-slate-500" />
               <input type="password" value={pw} onChange={e => setPw(e.target.value)} required minLength={4} placeholder="••••••••"
-                className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 border border-slate-200 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all" />
+                className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-900 dark:text-white placeholder:text-slate-400 dark:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all" />
             </div>
           </label>
           {err && (
@@ -68,11 +68,11 @@ export default function Auth() {
             {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <>{mode === "login" ? "Sign in" : "Create account"}<ArrowRight className="h-4 w-4" /></>}
           </motion.button>
         </form>
-        <p className="mt-6 text-center text-sm text-slate-500">
+        <p className="mt-6 text-center text-sm text-slate-500 dark:text-slate-400">
           {mode === "login" ? <>No account? <button onClick={() => setMode("register")} className="font-semibold text-indigo-600 hover:text-indigo-700">Register</button></>
             : <>Have an account? <button onClick={() => setMode("login")} className="font-semibold text-indigo-600 hover:text-indigo-700">Sign in</button></>}
         </p>
-        <Link to="/" className="mt-3 block text-center text-sm text-slate-400 hover:text-slate-600">← Back home</Link>
+        <Link to="/" className="mt-3 block text-center text-sm text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:text-slate-300">← Back home</Link>
       </motion.div>
     </div>
   );
