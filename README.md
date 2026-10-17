@@ -84,9 +84,9 @@ cd web/frontend && npm install && npm run build && cd ../..
 # open http://127.0.0.1:8000
 ```
 
-Full-stack web app: FastAPI backend (REST + WebSocket + SQLite + auth)
-with a responsive SPA frontend — start scans, watch live findings stream,
-browse reports, manage history. Register an account in the UI first.
+Full-stack web app: FastAPI backend (REST + SQLite/Postgres + auth)
+with a responsive SPA frontend — start scans, watch live findings stream
+via polling, browse reports, manage history. Register an account in the UI first.
 
 ## Test target
 
@@ -99,6 +99,37 @@ Run it, then scan it to see real findings:
 ```
 
 Expected: 2 critical SQLi, 3 XSS, 1 open redirect, 5 header misconfigurations.
+
+## Deploy to Vercel (serverless)
+
+The app is fully serverless-ready: one Python function (`api/index.py`),
+static frontend, Postgres for persistence, chunked scans (~240s per
+invocation, auto-chained via polling), and Vercel Cron for scheduled scans.
+No WebSockets — the live view polls `GET /api/scans/{id}/events` every 2s.
+
+1. **Database** — create a free Postgres (Neon, Supabase, or Vercel Postgres)
+   and copy the connection string.
+2. **Secrets** — generate a Fernet key: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+3. **Import** this repo in Vercel. The included `vercel.json` sets the build,
+   `maxDuration: 300`, and a `*/5 * * * *` cron for `/api/cron/tick`.
+4. **Environment variables** (Vercel → Settings → Environment Variables):
+
+   | Variable | Required | Purpose |
+   |----------|----------|---------|
+   | `DATABASE_URL` | yes | Postgres connection string (falls back to local SQLite when unset) |
+   | `SENTINELX_FERNET_KEY` | yes (prod) | encrypts saved auth-profile passwords; startup fails fast if missing on Vercel |
+   | `CRON_SECRET` | yes | protects `POST /api/cron/tick` — Vercel Cron sends it as `x-cron-secret` |
+
+   Optional: `VITE_API_URL` if you host the frontend separately from the API.
+
+5. Deploy. Register an account in the UI, then scan.
+
+Notes & honest limits:
+- Scans run in ~240s chunks chained automatically; very large targets take
+  several chunks (slower than the always-on backend, but real).
+- Only scan targets you own or have written permission to test.
+- Scanning from datacenter IPs gets WAF-blocked more often — keep the
+  heavy/stealth work on the CLI.
 
 ## Docker
 

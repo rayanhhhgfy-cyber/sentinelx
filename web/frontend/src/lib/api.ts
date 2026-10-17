@@ -34,15 +34,19 @@ function headers(): HeadersInit {
   if (t) h["Authorization"] = "Bearer " + t;
   return h;
 }
+/** Base URL for the API. Defaults to same-origin (monorepo deploy);
+ * set VITE_API_URL for split frontend/backend hosting. */
+export const API_BASE = (import.meta.env.VITE_API_URL as string || "").replace(/\/$/, "");
+const u = (path: string) => `${API_BASE}${path}`;
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
-  const r = await fetch(path, { ...opts, headers: { ...headers(), ...(opts.headers||{}) } });
+  const r = await fetch(u(path), { ...opts, headers: { ...headers(), ...(opts.headers||{}) } });
   if (r.status === 401) { localStorage.removeItem("sx_token"); location.href = "/login"; throw new Error("unauthorized"); }
   if (!r.ok) throw new Error((await r.text()).slice(0,300));
   const ct = r.headers.get("content-type") || "";
   return (ct.includes("json") ? r.json() : r.text()) as T;
 }
 const J = (b: unknown) => JSON.stringify(b);
-export const dlUrl = (path: string) => `${path}?token=${encodeURIComponent(localStorage.getItem("sx_token") || "")}`;
+export const dlUrl = (path: string) => `${API_BASE}${path}?token=${encodeURIComponent(localStorage.getItem("sx_token") || "")}`;
 
 export const api = {
   register: (email:string,name:string,password:string) => req<{token:string;user:User}>("/api/auth/register",{method:"POST",body:J({email,name,password})}),
@@ -141,10 +145,12 @@ export const api = {
     security_score:number; recent_scans:any[]; recent_findings:any[];
   }>("/api/dashboard/stats"),
 };
-export function wsUrl(scanId: string): string {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}/ws/scans/${scanId}?token=${encodeURIComponent(localStorage.getItem("sx_token")||"")}`;
-}
+export interface ScanEvent { seq: number; type: string; data: any; created_at: number; }
+/** Poll-based live stream (replaces the removed WebSocket endpoint). */
+export const scanEvents = (scanId: string, since = 0) =>
+  req<{events: ScanEvent[]}>(`/api/scans/${scanId}/events?since=${since}`);
+export const continueScan = (scanId: string) =>
+  req<{scan_id: string; status: string; chunk: string}>(`/api/scans/${scanId}/continue`, {method: "POST"});
 export const SEVS = ["critical","high","medium","low","info"] as const;
 export const FINDING_STATUSES = ["open","in_progress","resolved","verified","false_positive","accepted_risk"] as const;
 export const CHANNEL_EVENTS = ["scan_finished","critical_finding","scan_failed","sla_breach"] as const;
