@@ -43,6 +43,7 @@ DB_ERRORS = [
     (r"System\.Data\.SQLite", "SQLite"), (r"Warning.*sqlite_.*", "SQLite"),
     (r"sqlite3\.", "SQLite"),  # python sqlite3 module errors
     (r"\bnear\s+.+:\s*syntax error", "SQLite"),  # python: near "'": syntax error
+    (r"unrecognized token", "SQLite"),  # python sqlite3: unrecognized token: "'"
     (r"no such (table|column)\b", "SQLite"),
     # Generic / others
     (r"SQLSTATE", "Generic SQL"), (r"Syntax error.*SQL", "Generic SQL"),
