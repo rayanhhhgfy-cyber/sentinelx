@@ -116,8 +116,14 @@ def services():
 <ul><li>Brand identity</li><li>Web engineering</li><li>Cloud migration</li></ul>
 <p><a href="/download?file=cloud-migration-playbook.pdf">Download our cloud migration whitepaper</a></p>
 <p><a href="/download?file=brand-guidelines.pdf">Brand guidelines (PDF)</a></p>
+<h3>Whitepaper lookup</h3>
+<form id="nx-lookup" method="post" action="/api/v1/lookup">
+  <input type="text" id="lookup-code" name="code" placeholder="Enter whitepaper code…">
+  <button type="submit">Look up</button>
+</form>
+<div id="nx-lookup-result"></div>
 """
-    return page("Services", body, scripts=("main.js", "analytics.js"))
+    return page("Services", body, scripts=("main.js", "analytics.js", "lookup.js"))
 
 
 @app.route("/pricing")
@@ -242,6 +248,32 @@ def api_internal_stats():
         "revenue_mtd": 48210,
         "server": "prod-web-03",
         "db_host": "db-internal.nexora.local",
+    })
+
+
+@app.route("/api/v1/lookup", methods=["POST"])
+def api_v1_lookup():
+    # INTENTIONAL: JSON API with SQLi in body field + reflected custom header.
+    # Called by static/js/lookup.js with a full request shape (method, custom
+    # headers, JSON body) so scanners must reconstruct it from the JS.
+    data = request.get_json(silent=True) or {}
+    code = data.get("code", "")
+    req_id = request.headers.get("X-Request-ID", "")
+    con = sqlite3.connect(DB)
+    try:
+        row = con.execute(
+            f"SELECT title FROM posts WHERE title LIKE '%{code}%'"
+        ).fetchone()
+        err = ""
+    except Exception as e:
+        row, err = None, f"Lookup error: {e}"
+    con.close()
+    # INTENTIONAL: custom header reflected without validation
+    return jsonify({
+        "ok": True,
+        "result": row[0] if row else None,
+        "error": err,
+        "request_id": req_id,
     })
 
 
