@@ -109,5 +109,52 @@ async def scan_target(client: ScanClient, config: ScanConfig, target: str) -> li
     # path tricks
     for t in PATH_TRICKS:
         jobs.append(check("GET", t))
+    # --- method override: 403 -> 200 differential ---
+    # Some frameworks honor X-HTTP-Method-Override or _method param to bypass
+    # method-based access control. First establish the 403 baseline, then try
+    # overrides and look for a differential.
+    async def check_override():
+        async with sem:
+            h = dict(headers)
+            base_resp = await client.request("DELETE", root + "/admin", headers=h)
+            if not base_resp or base_resp.status_code != 403:
+                return  # no 403 baseline — nothing to bypass
+            overrides = [
+                ({"X-HTTP-Method-Override": "GET"}, {}),
+                ({"X-Method-Override": "GET"}, {}),
+                ({}, {"_method": "GET"}),
+                ({"X-HTTP-Method": "GET"}, {}),
+            ]
+            for oh, oparams in overrides:
+                hh = dict(headers); hh.update(oh)
+                url = root + "/admin"
+                if oparams:
+                    url += "?" + "&".join(f"{k}={v}" for k, v in oparams.items())
+                resp = await client.request("DELETE", url, headers=hh)
+                if resp and resp.status_code == 200 and len(resp.content) > 200:
+                    loginish = re.search(r"password|log\s*in|sign\s*in", resp.text, re.I)
+                    if not loginish:
+                        ev = Evidence(
+                            request_raw=raw_request("DELETE", url, hh, None),
+                            response_raw=raw_response(resp.status_code,
+                                                      dict(resp.headers),
+                                                      resp.content[:2000]),
+                            proof=(f"DELETE /admin → 403 baseline, but with "
+                                   f"{oh or oparams} → 200 ({len(resp.content)}b) — "
+                                   "method-override access control bypass"),
+                        )
+                        findings.append(Finding(
+                            type="Broken Access Control",
+                            subtype="method-override-bypass",
+                            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
+                            confidence=0.85, url=url, method="DELETE", param="",
+                            payload=str(oh or oparams), evidence=ev, cwe="CWE-425",
+                            owasp="A01:2021 – Broken Access Control",
+                            remediation=REMEDIATION_BAC + " Do not trust "
+                                        "X-HTTP-Method-Override / _method for authorization.",
+                            references=["https://owasp.org/www-community/attacks/Forced_browsing"],
+                        ))
+                        break
+    jobs.append(check_override())
     await asyncio.gather(*jobs)
     return findings

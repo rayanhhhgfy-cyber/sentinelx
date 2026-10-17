@@ -125,6 +125,16 @@ REMEDIATION_XSS = (
 )
 
 
+# DOM clobbering vectors (mutation-based XSS): payloads that don't need
+# <script> — they overwrite JS variables via id/name attributes
+DOM_CLOBBER_PAYLOADS = [
+    '<img name="config" src="x">',           # clobbers window.config
+    '<form name="settings"><input name="apiUrl"></form>',
+    '<div id="location" data-x="1">',        # shadows window.location props
+    '<a id="defaultView"></a>',
+]
+
+
 def detect_context(body: str, canary: str) -> list[str]:
     p = _ContextParser(canary)
     try:
@@ -199,5 +209,93 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                     ))
                     break
             if any(f.param == param and f.url == full for f in findings):
+                break
+
+        # ---- DOM clobbering probe: id/name injection without <script> ----
+        clobber_canary = make_canary()
+        for payload in DOM_CLOBBER_PAYLOADS:
+            tagged = payload.replace('sx', clobber_canary[:8])
+            # inject canary-derived id/name
+            probe = tagged.replace(clobber_canary[:8], clobber_canary)
+            r3, full3, body3 = await _send(
+                client, method, url, params, param, params[param] + probe)
+            if not r3:
+                continue
+            # clobbering succeeds if our id/name lands in the DOM unencoded
+            if clobber_canary in r3.text and "<script" not in probe.lower():
+                # verify it's in an id= or name= attribute (clobberable position)
+                if re.search(r'(id|name)\s*=\s*["\']?[^"\'>]*' + re.escape(clobber_canary),
+                             r3.text, re.I):
+                    ev = Evidence(
+                        request_raw=raw_request(method, full3, headers, body3),
+                        response_raw=raw_response(r3.status_code, dict(r3.headers), r3.content),
+                        proof=(f"Attacker-controlled id/name '{clobber_canary}' reflected into DOM — "
+                               "DOM clobbering primitive (can shadow window properties)"),
+                    )
+                    findings.append(Finding(
+                        type="Cross-Site Scripting", subtype="dom-clobbering",
+                        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+                        confidence=0.80, url=full3, method=method, param=param,
+                        payload=probe, evidence=ev, cwe="CWE-79",
+                        owasp="A03:2021 – Injection",
+                        remediation=REMEDIATION_XSS,
+                        references=["https://owasp.org/www-community/attacks/DOM_Clobbering"],
+                    ))
+                    break
+    return findings
+
+
+async def scan_second_order(client: ScanClient, config: ScanConfig,
+                            submit_url: str, submit_method: str,
+                            submit_params: dict, param: str,
+                            check_urls: list[str]) -> list[Finding]:
+    """Second-order XSS: submit payload to one endpoint, then check whether
+    it reflects/executes on DIFFERENT pages (stored-then-triggered).
+
+    check_urls: other discovered endpoints to inspect after submission.
+    Only called when the primary reflected scan found nothing on this param
+    (avoids doubling requests on already-vulnerable params)."""
+    findings: list[Finding] = []
+    canary = make_canary()
+    payload = f"<script>{canary}</script>"
+    headers = {"User-Agent": config.user_agent}
+
+    # 1. submit
+    p = dict(submit_params); p[param] = submit_params.get(param, "") + payload
+    if submit_method == "GET":
+        full = submit_url + ("&" if "?" in submit_url else "?") + _urlencode(p)
+        sresp = await client.get(full)
+    else:
+        sresp = await client.post(submit_url, data=p)
+        full = submit_url
+    if not sresp:
+        return findings
+
+    # 2. check other pages for the canary (limit to 5 to bound requests)
+    for check_url in check_urls[:5]:
+        if check_url == submit_url:
+            continue
+        cresp = await client.get(check_url)
+        if not cresp:
+            continue
+        if canary in cresp.text and "<script>" in cresp.text:
+            # confirm it's our payload, not coincidence
+            if payload in cresp.text or canary in cresp.text:
+                ev = Evidence(
+                    request_raw=raw_request(submit_method, full, headers, None),
+                    response_raw=raw_response(cresp.status_code, dict(cresp.headers),
+                                              cresp.content),
+                    proof=(f"Payload submitted to {submit_url} reflected in "
+                           f"different page {check_url} — second-order (stored) XSS"),
+                )
+                findings.append(Finding(
+                    type="Cross-Site Scripting", subtype="second-order-stored",
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+                    confidence=0.85, url=check_url, method="GET", param=param,
+                    payload=payload, evidence=ev, cwe="CWE-79",
+                    owasp="A03:2021 – Injection",
+                    remediation=REMEDIATION_XSS + " Store input encoded; encode on output.",
+                    references=["https://owasp.org/www-community/attacks/xss/"],
+                ))
                 break
     return findings

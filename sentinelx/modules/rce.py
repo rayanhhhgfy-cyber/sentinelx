@@ -104,30 +104,49 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         if findings:
             continue
 
-        # 2. time-based with baseline subtraction (adaptive delay)
+        # 2. time-based with statistical timing (5 samples, outlier rejection)
+        # Measures baseline jitter, then requires 4/5 injected samples to
+        # exceed threshold. Outlier rejection: drop the single highest
+        # baseline sample before computing threshold.
         for tmpl in TIME_CMDS:
             payload = tmpl.format(d=int(delay))
+            # baseline: 5 samples, drop highest (outlier), take max of rest
+            bl_samples = []
+            for _ in range(5):
+                _, _, _, el = await _send(
+                    client, method, url, params, param, params[param])
+                bl_samples.append(el)
+            bl_samples.sort()
+            bl_ref = max(bl_samples[:-1]) if len(bl_samples) > 1 else bl_samples[0]
+            # injected: 5 samples
             samples = []
-            for _ in range(2):
+            last_full, last_body, last_resp = "", None, None
+            for _ in range(5):
                 resp, full, body_sent, el = await _send(
                     client, method, url, params, param, params[param] + payload)
                 if resp is None:
                     break
                 samples.append(el)
-            if len(samples) < 2:
+                last_full, last_body, last_resp = full, body_sent, resp
+            if len(samples) < 5:
                 continue
-            threshold = base_max + delay * 0.7
-            if all(s >= threshold for s in samples) and base_max < delay * 0.5:
+            threshold = bl_ref + delay * 0.7
+            hits = sum(1 for s in samples if s >= threshold)
+            # require 4/5 and baseline itself fast
+            if hits >= 4 and bl_ref < delay * 0.5:
                 ev = Evidence(
-                    request_raw=raw_request(method, full, headers, body_sent),
-                    response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content),
-                    proof=(f"Command delay {samples[0]:.1f}s/{samples[1]:.1f}s vs "
-                           f"baseline max {base_max:.2f}s"),
+                    request_raw=raw_request(method, last_full, headers, last_body),
+                    response_raw=raw_response(
+                        last_resp.status_code, dict(last_resp.headers),
+                        last_resp.content),
+                    proof=(f"Statistical timing: {hits}/5 samples delayed "
+                           f"(avg {sum(samples)/len(samples):.1f}s) vs "
+                           f"baseline max {bl_ref:.2f}s (outlier rejected)"),
                 )
                 findings.append(Finding(
-                    type="OS Command Injection", subtype="time-blind",
+                    type="OS Command Injection", subtype="time-blind-statistical",
                     cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-                    confidence=0.85, url=full, method=method, param=param,
+                    confidence=0.90, url=last_full, method=method, param=param,
                     payload=payload, evidence=ev, cwe="CWE-78",
                     owasp="A03:2021 – Injection",
                     remediation=REMEDIATION_RCE,
