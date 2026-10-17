@@ -87,6 +87,7 @@ class _DeepParser(HTMLParser):
         self._select_options: list[str] = []
         self.scripts: list[str] = []       # inline script bodies
         self.framework_hints: set[str] = set()
+        self.comment_urls: set[str] = set()  # paths/URLs mined from HTML comments
         self._script_depth = 0
 
     @property
@@ -185,6 +186,17 @@ class _DeepParser(HTMLParser):
         if self._in_script:
             self.scripts.append(data)
             self._check_framework_js(data)
+
+    def handle_comment(self, data):
+        # Mine paths/URLs from HTML comments, e.g.
+        # <!-- backup: /backup.zip -->, <!-- TODO: remove /api/v2/internal -->
+        # These are DISCOVERED (present in the response), not guessed.
+        for m in re.finditer(r"""["']?((?:/|\./)[A-Za-z0-9_\-./?=&%#]{2,})["']?""", data):
+            path = m.group(1).rstrip(".,;:'\"")
+            # skip obvious non-paths (file extensions of assets handled by should_skip later)
+            if len(path) < 3 or path.startswith("//"):
+                continue
+            self.comment_urls.add(urljoin(self.base, path))
 
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
@@ -285,6 +297,17 @@ API_BASE_RE = re.compile(
 # param mining: URLSearchParams, query strings in code
 URLSEARCHPARAMS_RE = re.compile(r"""URLSearchParams\(\s*["']([^"']+)["']""")
 QUERY_IN_CODE_RE = re.compile(r"""[?&]([a-zA-Z_][a-zA-Z0-9_]*)=["']?\{?[^&"'}\s]*""")
+# WebSocket endpoints referenced in JS
+WS_URL_RE = re.compile(r"""["'](wss?://[A-Za-z0-9_\-./?=&%#:]+)["']""")
+# browser storage keys used by the app (useful intel, mined not guessed)
+STORAGE_KEY_RE = re.compile(
+    r"""(?:localStorage|sessionStorage)\.(?:getItem|setItem|removeItem)\s*\(\s*["']([^"']{1,64})["']""")
+# custom header names set by JS (e.g. setRequestHeader("X-Api-Key", ...))
+HEADER_NAME_RE = re.compile(
+    r"""setRequestHeader\s*\(\s*["']([^"']{1,64})["']""")
+# headers object literals: headers: { "X-Foo": ... } or {"X-Foo": "..."}
+HEADERS_OBJ_RE = re.compile(
+    r"""["'](X-[A-Za-z0-9_\-]{1,48})["']\s*:""")
 
 
 def extract_js_endpoints(js_text: str, base_url: str) -> set[str]:
@@ -297,7 +320,10 @@ def extract_js_endpoints(js_text: str, base_url: str) -> set[str]:
         out.add(urljoin(base_url, m.group(1)))
     base_host = urlsplit(base_url).netloc
     return {u for u in out
-            if urlsplit(u).netloc in ("", base_host) and not should_skip(u)}
+            if urlsplit(u).netloc in ("", base_host)
+            and not should_skip(u)
+            and not re.search(r"\.(js|css|map|woff2?|ttf|eot)(\?|$)",
+                              urlsplit(u).path, re.I)}
 
 
 def extract_spa_routes(js_text: str, base_url: str) -> set[str]:
@@ -338,6 +364,24 @@ def mine_params_from_js(js_text: str) -> dict[str, str]:
     return params
 
 
+def extract_ws_endpoints(js_text: str) -> set[str]:
+    """WebSocket URLs referenced in JS (wss://host/path). Returned as-is;
+    the caller may map them to https:// for HTTP probing."""
+    return {m.group(1) for m in WS_URL_RE.finditer(js_text)}
+
+
+def mine_storage_keys(js_text: str) -> set[str]:
+    """Browser storage keys the app actually uses (mined, not guessed)."""
+    return {m.group(1) for m in STORAGE_KEY_RE.finditer(js_text)}
+
+
+def mine_header_names(js_text: str) -> set[str]:
+    """Custom header names the app's JS actually sets (mined, not guessed)."""
+    out = {m.group(1) for m in HEADER_NAME_RE.finditer(js_text)}
+    out.update(m.group(1) for m in HEADERS_OBJ_RE.finditer(js_text))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Scope helpers
 # ---------------------------------------------------------------------------
@@ -353,8 +397,11 @@ SKIP_PATTERNS = [
 
 
 def should_skip(url: str) -> bool:
+    # only inspect the PATH — query values like ?file=doc.pdf are attack
+    # surface, not static assets (regression: /download?file=x.pdf was skipped)
+    path = urlsplit(url).path
     for pat in SKIP_PATTERNS:
-        if pat.search(url):
+        if pat.search(path):
             return True
     return False
 
@@ -386,6 +433,10 @@ class Crawler:
         self.frameworks: set[str] = set()
         self.auth_surfaces: list[dict] = []   # detected login forms
         self.csrf_tokens: dict[str, str] = {}  # url -> token name=value
+        self.storage_keys: set[str] = set()   # browser storage keys mined from JS
+        self.header_names: set[str] = set()   # custom header names mined from JS
+        self.ws_urls: set[str] = set()         # websocket URLs mined from JS
+        self.js_urls: set[str] = set()          # JS bundle URLs actually downloaded
 
     def in_scope(self, url: str) -> bool:
         u = urlsplit(url)
@@ -490,8 +541,9 @@ class Crawler:
         ctype = resp.headers.get("content-type", "")
         new_links: list[str] = []
 
-        # JS files: extract endpoints + SPA routes + API bases + mined params
+        # JS files: download + extract endpoints + SPA routes + API bases + mined params
         if "javascript" in ctype or url.endswith(".js"):
+            self.js_urls.add(clean)
             self._process_js(resp.text, url)
             return []
 
@@ -501,6 +553,13 @@ class Crawler:
                 self.add_endpoint(Endpoint(url=clean, params=params,
                                            source="crawl", content_type=ctype))
             return []
+
+        # HTML page: ensure it's a testable endpoint even WITHOUT params.
+        # Page-level modules (domxss: NEEDS_PARAMS=False) analyze page content,
+        # not query strings. Param-testing modules skip param-less endpoints.
+        if not params:
+            self.add_endpoint(Endpoint(url=clean, params={}, source="crawl-page",
+                                       content_type=ctype))
 
         parser = _DeepParser(url)
         try:
@@ -518,6 +577,14 @@ class Crawler:
             if self.in_scope(durl) and not should_skip(durl):
                 c, p = split_params(durl)
                 self.add_endpoint(Endpoint(url=c, params=p, source="crawl"))
+        # HTML-comment URLs become endpoints (discovered, not guessed).
+        # No should_skip here: if a human referenced it in a comment it is
+        # worth one probe (e.g. <!-- backup: /backup.zip -->). The crawler
+        # never recurses into these (only modules test them).
+        for curl in parser.comment_urls:
+            if self.in_scope(curl):
+                c, p = split_params(curl)
+                self.add_endpoint(Endpoint(url=c, params=p, source="comment"))
 
         # deep form analysis
         for form in parser.forms:
@@ -544,20 +611,106 @@ class Crawler:
             # replay CSRF token automatically (already in inputs)
             self.add_endpoint(ep)
 
-        # JS analysis on inline scripts + full page text
-        self._process_js(resp.text, url)
+        # JS analysis on inline scripts ONLY. HTML links/forms already carry
+        # their own query strings (via split_params); mining the full HTML
+        # causes param pollution (e.g. ?next= from the nav landing on /about).
         for script in parser.scripts:
             self._process_js(script, url)
 
+        # JS execution in the virtual browser (pure Python, no headless
+        # browser): for SPA pages or scripts with sink/source patterns,
+        # execute and harvest API calls + routes the static pass misses.
+        if parser.framework_hints or self._js_worth_executing(parser.scripts):
+            await self._process_js_execution(parser.scripts, url)
+
         return new_links
 
+    def _js_worth_executing(self, scripts: list[str]) -> bool:
+        """Cheap gate: execute only if a script shows sink/source interest."""
+        try:
+            from sentinelx.jsenv.static import score_js_interest
+        except ImportError:
+            return False
+        for js in scripts:
+            if len(js) > 60000:
+                continue
+            try:
+                score, _, _ = score_js_interest(js)
+            except Exception:
+                continue
+            if score >= 10:
+                return True
+        return False
+
+    async def _process_js_execution(self, scripts: list[str], page_url: str):
+        """Execute inline scripts in the virtual browser; harvest the
+        network calls and routes observed during execution."""
+        interesting = [s for s in scripts if s.strip() and len(s) < 60000][:8]
+        if not interesting:
+            return
+        try:
+            from sentinelx.jsenv.executor import execute_scripts
+        except ImportError:
+            return
+        try:
+            result = await asyncio.to_thread(execute_scripts, interesting, page_url)
+        except Exception:
+            return
+        if not result.executed:
+            return
+        for call in result.api_calls:
+            u = call.get("url", "")
+            if not u or not self.in_scope(u):
+                continue
+            c, p = split_params(u.split("#")[0])
+            if should_skip(c):
+                continue
+            self.add_endpoint(Endpoint(
+                url=c, method=call.get("method", "GET"), params=p,
+                source="js-exec",
+                content_type="application/json" if "/api/" in c else "",
+            ))
+        base = f"{self.target_scheme}://{self.target_host}"
+        for route in result.routes:
+            r = route.split(":", 1)[-1].strip()
+            if not r.startswith("/"):
+                continue
+            full = urljoin(base, r)
+            if self.in_scope(full) and not should_skip(full):
+                c, p = split_params(full)
+                self.add_endpoint(Endpoint(url=c, params=p, source="js-exec-route"))
+
     def _process_js(self, js_text: str, base_url: str):
-        for ep_url in extract_js_endpoints(js_text, base_url):
+        for m in JS_ENDPOINT_RE.finditer(js_text):
+            ep_url = urljoin(base_url, m.group(1))
+            # skip asset files: they're downloaded via the crawl queue, not tested
+            if re.search(r"\.(js|css|map|woff2?|ttf|eot)(\?|$)", urlsplit(ep_url).path, re.I):
+                continue
+            if not self.in_scope(ep_url) or should_skip(ep_url):
+                continue
             c, p = split_params(ep_url)
-            # mined params from JS enrich endpoint params
-            mined = mine_params_from_js(js_text)
-            for k, v in mined.items():
+            # proximity param mining: only attach params that appear NEAR this
+            # URL in the source (±600 chars), not every param in the whole file
+            window = js_text[max(0, m.start() - 600):m.end() + 600]
+            for k, v in mine_params_from_js(window).items():
                 p.setdefault(k, v)
+            self.add_endpoint(Endpoint(url=c, params=p, source="js"))
+        for m in FETCH_RE.finditer(js_text):
+            ep_url = urljoin(base_url, m.group(1))
+            if re.search(r"\.(js|css|map|woff2?|ttf|eot)(\?|$)", urlsplit(ep_url).path, re.I):
+                continue
+            if not self.in_scope(ep_url) or should_skip(ep_url):
+                continue
+            c, p = split_params(ep_url)
+            window = js_text[max(0, m.start() - 600):m.end() + 600]
+            for k, v in mine_params_from_js(window).items():
+                p.setdefault(k, v)
+            self.add_endpoint(Endpoint(url=c, params=p, source="js"))
+        for m in API_PATH_RE.finditer(js_text):
+            ep_url = urljoin(base_url, m.group(1))
+            if not self.in_scope(ep_url) or should_skip(ep_url):
+                continue
+            c, p = split_params(ep_url)
             self.add_endpoint(Endpoint(url=c, params=p, source="js"))
         for route_url in extract_spa_routes(js_text, base_url):
             c, p = split_params(route_url)
@@ -567,6 +720,17 @@ class Crawler:
             c, p = split_params(api_base)
             if self.in_scope(c):
                 self.add_endpoint(Endpoint(url=c, params=p, source="js"))
+        # WebSocket URLs: record as seen, and also queue the https://
+        # counterpart as a discovered endpoint (same host usually serves it)
+        for ws_url in extract_ws_endpoints(js_text):
+            self.ws_urls.add(ws_url)
+            http_url = re.sub(r"^wss?://", "https://", ws_url)
+            if self.in_scope(http_url) and not should_skip(http_url):
+                c, p = split_params(http_url)
+                self.add_endpoint(Endpoint(url=c, params=p, source="js-ws"))
+        # storage keys + custom header names: mined intel for modules
+        self.storage_keys.update(mine_storage_keys(js_text))
+        self.header_names.update(mine_header_names(js_text))
 
     async def run(self) -> list[Endpoint]:
         max_pages = getattr(self.config, "max_pages", 50)
