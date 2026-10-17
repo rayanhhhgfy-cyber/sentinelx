@@ -28,10 +28,12 @@ PUBLIC_CATALOG_PARAM_RE = re.compile(
 
 # Markers of user-private data: if the response contains these, the endpoint
 # returns user-specific data and ID enumeration is a real test.
+# NOTE: bare "username"/"phone" are NOT markers — every login form has them.
+# Only count them when paired with an actual value (e.g. "Username: carlos").
 PRIVATE_DATA_RE = re.compile(
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"  # email address
     r"|my account|my profile|my orders|order history|log\s?out|sign\s?out"
-    r"|username|phone|date of birth|\bssn\b|credit card|my address",
+    r"|username\s*:\s*\S|phone\s*:\s*\S|date of birth|\bssn\b|credit card|my address",
     re.I)
 
 # Path segments that indicate a public catalog (for path-based enumeration)
