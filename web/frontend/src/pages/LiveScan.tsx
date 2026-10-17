@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { Radar, Square, ArrowRight, Activity, AlertTriangle, CircleDot, Pause, Play, Share2 } from "lucide-react";
-import { api, wsUrl } from "../lib/api";
+import { api, scanEvents, continueScan } from "../lib/api";
 import type { Finding } from "../lib/api";
 import { Btn } from "../components/ui";
 import { ShareDialog, ScanComments } from "../components/dialogs";
@@ -23,20 +23,58 @@ export default function LiveScan() {
 
   useEffect(() => {
     if (!id) return;
-    push("◈ connecting to scan stream…");
-    const ws = new WebSocket(wsUrl(id));
-    ws.onopen = () => push("◈ connected — streaming live events", "text-emerald-400");
-    ws.onmessage = (ev) => {
-      const m = JSON.parse(ev.data);
-      if (m.type === "progress") push("… " + m.data);
-      else if (m.type === "finding") {
-        setFindings(f => [...f, m.data]);
-        push(`● [${m.data.severity.toUpperCase()}] ${m.data.type} — ${m.data.url}`, "text-rose-400");
+    let alive = true;
+    let lastSeq = 0;
+    let pumping = false;
+    push("◈ live polling started (2s)…");
+    const seenIds = new Set<string>();
+    const tick = async () => {
+      if (!alive || pumping) return;
+      pumping = true;
+      try {
+        const ev = await scanEvents(id, lastSeq);
+        for (const m of ev.events) {
+          lastSeq = Math.max(lastSeq, m.seq);
+          if (m.type === "progress") push("… " + String(m.data));
+          else if (m.type === "finding") {
+            const d = m.data;
+            if (!seenIds.has(String(d.db_id ?? d.id))) {
+              seenIds.add(String(d.db_id ?? d.id));
+              setFindings(f => [...f, d as Finding]);
+              push(`● [${String(d.severity).toUpperCase()}] ${d.type} — ${d.url}`, "text-rose-400");
+            }
+          } else if (m.type === "done") {
+            push(`✓ scan ${m.data.status}: ${m.data.findings ?? ""} findings`, "text-emerald-400");
+            if (m.data.status !== "running") setDone(true);
+          }
+        }
+        // chunked serverless scans: trigger the next chunk when ready
+        const s = await api.getScan(id);
+        if (!alive) return;
+        if (s.status === "chunk_done") {
+          push("◈ chunk complete — requesting next…");
+          const r = await continueScan(id);
+          if (r.status === "completed" || r.status === "failed" || r.status === "cancelled") setDone(true);
+        } else if (["completed", "failed", "cancelled"].includes(s.status)) {
+          // final findings refresh for accuracy
+          try {
+            const all = await api.listFindings(id);
+            if (Array.isArray(all)) {
+              setFindings(all);
+              all.forEach(f => seenIds.add(String((f as any)._db_id ?? f.id)));
+            }
+          } catch { /* keep streamed findings */ }
+          setDone(true);
+        }
+      } catch (e: any) {
+        push("✗ poll error: " + String(e.message || e).slice(0, 120), "text-rose-400");
+      } finally {
+        pumping = false;
       }
-      else if (m.type === "done") { push(`✓ scan complete: ${m.data.findings} findings`, "text-emerald-400"); setDone(true); }
     };
-    ws.onerror = () => push("✗ websocket error", "text-rose-400");
-    return () => ws.close();
+    tick();
+    const iv = setInterval(tick, 2000);
+    return () => { alive = false; clearInterval(iv); };
   }, [id]);
 
   useEffect(() => { termRef.current?.scrollTo(0, termRef.current.scrollHeight); }, [logs]);
