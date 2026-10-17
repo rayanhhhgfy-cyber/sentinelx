@@ -213,7 +213,8 @@ function fetch(url, opts) {
         if (opts.body !== undefined && opts.body !== null) { body = String(opts.body).slice(0, 2000); }
         if (opts.headers) { try { headers = JSON.parse(JSON.stringify(opts.headers)); } catch (e) {} }
     }
-    __sx_log("net:fetch", {url: String(url).slice(0, 1000), method: method, body: body});
+    __sx_log("net:fetch", {url: String(url).slice(0, 1000), method: method,
+                           body: body, headers: headers});
     // minimal thenable so `fetch(u).then(...)` does not throw
     return { then: function(a, b) { return { catch: function(c) {} }; }, catch: function(c) {} };
 }
@@ -223,15 +224,18 @@ window.fetch = fetch;
 function XMLHttpRequest() {
     var self_ = this;
     this.readyState = 0; this.status = 0; this.responseText = ""; this.response = "";
-    this._method = ""; this._url = "";
+    this._method = ""; this._url = ""; this._headers = {};
     this.open = function(method, url, async) {
         self_._method = String(method).toUpperCase(); self_._url = String(url);
         __sx_log("net:xhr-open", {url: String(url).slice(0, 1000), method: self_._method});
     };
-    this.setRequestHeader = function(k, v) {};
+    this.setRequestHeader = function(k, v) {
+        try { self_._headers[String(k)] = String(v).slice(0, 500); } catch (e) {}
+    };
     this.send = function(body) {
         __sx_log("net:xhr-send", {url: self_._url.slice(0, 1000), method: self_._method,
-                                  body: (body === undefined || body === null) ? null : String(body).slice(0, 2000)});
+                                  body: (body === undefined || body === null) ? null : String(body).slice(0, 2000),
+                                  headers: self_._headers});
     };
     this.abort = function() {};
     this.addEventListener = function(t, fn) {};
