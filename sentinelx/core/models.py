@@ -12,6 +12,12 @@ from typing import Optional
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
+# Confidence levels — never mark CONFIRMED without sufficient evidence.
+# Static-only indicators must use LOW/INFORMATIONAL and set static_only=True.
+CONFIDENCE_ORDER = {
+    "CONFIRMED": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFORMATIONAL": 0,
+}
+
 
 def cvss31_score(vector: str) -> float:
     """Compute CVSS 3.1 base score from a vector string like
@@ -89,6 +95,22 @@ class Finding:
     references: list = field(default_factory=list)
     curl_command: str = ""
     timestamp: float = field(default_factory=time.time)
+    # --- jsruntime / correlation extensions (all optional, backward-compatible)
+    confidence_level: str = ""          # CONFIRMED/HIGH/MEDIUM/LOW/INFORMATIONAL
+    execution_trace: list = field(default_factory=list)  # structured runtime trace
+    source: str = ""                    # taint source, e.g. "fragment(location.hash)"
+    sink: str = ""                      # taint sink, e.g. "sink:innerHTML"
+    static_only: bool = False           # True = indicator only, not verified
+
+    def set_confidence(self, level: str) -> "Finding":
+        """Set confidence level; also maps to the legacy float scale."""
+        level = level.upper()
+        if level not in CONFIDENCE_ORDER:
+            raise ValueError(f"unknown confidence level: {level}")
+        self.confidence_level = level
+        # legacy float: CONFIRMED=1.0, HIGH=0.8, MEDIUM=0.6, LOW=0.4, INFORMATIONAL=0.2
+        self.confidence = [0.2, 0.4, 0.6, 0.8, 1.0][CONFIDENCE_ORDER[level]]
+        return self
 
     def finalize(self, seq: int) -> "Finding":
         self.id = f"sx-{seq:03d}"
