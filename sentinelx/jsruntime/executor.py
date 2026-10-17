@@ -1,4 +1,4 @@
-"""SentinelX jsruntime.executor: run page JavaScript in js2py.
+"""SentinelX jsruntime.executor: run page JavaScript in node.
 
 ``execute()`` runs JS against the mock browser environment and returns a
 structured ``ExecutionResult``. It NEVER raises — a broken script, a hung
@@ -6,19 +6,17 @@ script, or an unsupported API cannot crash the scan.
 
 Safety controls:
 - per-script byte size limit (skip pathological bundles)
-- wall-clock timeout via worker thread (abandoned, never joined-killed)
-- recursion limit inside the worker
-- all js2py exceptions captured into result.errors
+- wall-clock timeout via subprocess (node is SIGKILLed on timeout)
+- node-only globals shadowed in the preamble (process/require/Buffer...)
+- all node errors captured into result.errors
 """
 
 from __future__ import annotations
 
-import concurrent.futures
-import sys
 import time
 from dataclasses import dataclass, field
 
-from . import mock as _mock
+from . import node_exec as _node
 
 
 @dataclass
@@ -59,66 +57,12 @@ def _bucket_for(kind: str) -> str | None:
     return None
 
 
-def _to_python(value, _depth: int = 0):
-    """Convert js2py values to plain Python (dicts/lists/strs).
-
-    js2py wraps both arrays and objects as JsObjectWrapper with both
-    to_list() and to_dict(). Arrays are detected via to_list(); plain
-    objects fall back to to_dict().
-    """
-    if _depth > 8:
-        return str(value)[:500]
-    try:
-        if hasattr(value, "to_list") and hasattr(value, "to_dict"):
-            try:
-                l = value.to_list()
-            except Exception:
-                l = None
-            # to_list() on a plain object returns []; on an array returns items.
-            # Disambiguate via to_dict(): dense numeric keys => array.
-            if l:
-                return [_to_python(v, _depth + 1) for v in l]
-            try:
-                d = value.to_dict()
-            except Exception:
-                return str(value)[:500]
-            if d and all(str(k).isdigit() for k in d.keys()):
-                # array-like (possibly empty)
-                return [_to_python(d[k], _depth + 1)
-                        for k in sorted(d.keys(), key=int)]
-            return {str(k): _to_python(v, _depth + 1) for k, v in d.items()}
-        if hasattr(value, "to_dict"):
-            try:
-                d = value.to_dict()
-            except Exception:
-                return str(value)[:500]
-            return {str(k): _to_python(v, _depth + 1) for k, v in d.items()}
-        if hasattr(value, "to_list"):
-            try:
-                l = value.to_list()
-            except Exception:
-                return str(value)[:500]
-            return [_to_python(v, _depth + 1) for v in l]
-    except Exception:
-        pass
-    if isinstance(value, (dict, list, str, int, float, bool)) or value is None:
-        if isinstance(value, dict):
-            return {str(k): _to_python(v, _depth + 1) for k, v in value.items()}
-        if isinstance(value, list):
-            return [_to_python(v, _depth + 1) for v in value]
-        return value
-    try:
-        return str(value)[:2000]
-    except Exception:
-        return "<unprintable>"
-
-
 def _rewrite_dangerous_calls(js: str) -> str:
     """Rewrite bare eval(/Function( calls to interceptable __sx_* versions.
 
-    js2py treats ``eval`` and the ``Function`` constructor as special
-    forms, so preamble overrides are bypassed. We rewrite them in the
-    page source instead. String literals and comments are left untouched
+    The preamble defines __sx_eval/__sx_Function (record-only, never
+    execute). We rewrite them in the page source instead of relying on
+    global overrides. String literals and comments are left untouched
     via a small state-machine tokenizer.
     """
     out: list[str] = []
@@ -141,6 +85,38 @@ def _rewrite_dangerous_calls(js: str) -> str:
                     break
                 i += 1
             continue
+        # template literals (node supports ES6; treat like strings)
+        if c == "`":
+            out.append(c)
+            i += 1
+            while i < n:
+                if js[i] == "\\" and i + 1 < n:
+                    out.append(js[i:i + 2])
+                    i += 2
+                    continue
+                if js[i] == "$" and i + 1 < n and js[i + 1] == "{":
+                    # ${...} interpolation — copy balanced braces verbatim
+                    # but still rewrite eval/ inside via recursion
+                    out.append("${")
+                    i += 2
+                    depth = 1
+                    start = i
+                    while i < n and depth > 0:
+                        if js[i] == "{":
+                            depth += 1
+                        elif js[i] == "}":
+                            depth -= 1
+                        i += 1
+                    inner = js[start:i - 1]
+                    out.append(_rewrite_dangerous_calls(inner))
+                    out.append("}")
+                    continue
+                out.append(js[i])
+                if js[i] == "`":
+                    i += 1
+                    break
+                i += 1
+            continue
         # comments
         if c == "/" and i + 1 < n and js[i + 1] == "/":
             j = js.find("\n", i)
@@ -154,9 +130,6 @@ def _rewrite_dangerous_calls(js: str) -> str:
             out.append(js[i:j])
             i = j
             continue
-        # regex literal heuristic: /.../  (skip; rare in our context, and
-        # rewriting inside regex is harmless as we only match eval(/Function()
-        # identifier patterns which cannot validly appear bare in regex)
         # identifier check
         if c.isalpha() or c in ("_", "$"):
             j = i + 1
@@ -180,13 +153,10 @@ def _rewrite_dangerous_calls(js: str) -> str:
                 p = i - 1
                 while p >= 0 and js[p] in (" \t\r\n"):
                     p -= 1
-                if p >= 0 and js[p:p + 3] == "new":
-                    # 'new Function(' -> 'new __sx_Function('
+                if p < 0 or js[p] not in (".",):
                     out.append("__sx_Function")
-                else:
-                    out.append("__sx_Function")
-                i = j
-                continue
+                    i = j
+                    continue
             out.append(word)
             i = j
             continue
@@ -195,47 +165,12 @@ def _rewrite_dangerous_calls(js: str) -> str:
     return "".join(out)
 
 
-def _run_in_worker(preamble: str, js_code: str) -> tuple[list, list]:
-    """Execute JS in this thread. Returns (trace, errors)."""
-    import js2py
-
-    errors: list[str] = []
-    # Bound Python recursion: page JS recursion becomes Python recursion.
-    old_limit = sys.getrecursionlimit()
-    try:
-        sys.setrecursionlimit(5000)
-    except Exception:
-        pass
-    try:
-        ctx = js2py.EvalJs({})
-        ctx.execute(preamble)
-        try:
-            ctx.execute(_rewrite_dangerous_calls(js_code))
-        except Exception as e:  # noqa: BLE001 — capture, never propagate
-            errors.append(f"{type(e).__name__}: {str(e)[:300]}")
-        # Extract the trace
-        trace: list = []
-        try:
-            raw = ctx.__sx_trace
-            trace = _to_python(raw) or []
-            if not isinstance(trace, list):
-                trace = []
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"trace-extract: {type(e).__name__}: {str(e)[:200]}")
-        return trace, errors
-    finally:
-        try:
-            sys.setrecursionlimit(old_limit)
-        except Exception:
-            pass
-
-
 def execute(js_code: str, page_url: str = "",
             hash_canary: str = "SX_CANARY",
             search_canary: str = "SX_CANARY",
             timeout: float = 10.0,
             max_script_bytes: int = 200_000) -> ExecutionResult:
-    """Execute JS in the virtual browser. Never raises.
+    """Execute JS in the virtual browser (node). Never raises.
 
     Returns ExecutionResult with categorized observations.
     """
@@ -249,33 +184,22 @@ def execute(js_code: str, page_url: str = "",
             f"script too large ({len(js_code)} chars > {max_script_bytes}); skipped")
         return result
 
-    preamble = _mock.build_preamble(page_url, hash_canary, search_canary)
-
-    trace: list = []
-    errors: list[str] = []
-    # NOTE: not a context manager — on timeout we shutdown(wait=False) so an
-    # abandoned infinite-loop worker never blocks the scan.
-    pool = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="sx-js")
-    try:
-        fut = pool.submit(_run_in_worker, preamble, js_code)
-        try:
-            trace, errors = fut.result(timeout=timeout)
-            result.executed = True
-        except concurrent.futures.TimeoutError:
-            fut.cancel()
-            errors.append(f"timeout after {timeout:.1f}s; worker abandoned")
-            result.executed = False
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"worker: {type(e).__name__}: {str(e)[:200]}")
-    finally:
-        try:
-            pool.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+    rewritten = _rewrite_dangerous_calls(js_code)
+    trace, errors = _node.execute_js_node(
+        rewritten, page_url=page_url,
+        hash_canary=hash_canary, search_canary=search_canary,
+        timeout=timeout,
+    )
 
     result.trace = trace if isinstance(trace, list) else []
     result.errors = errors
+    # executed=True when node ran and dumped a trace (even an empty one).
+    # A timeout or spawn failure leaves executed=False.
+    result.executed = not any(
+        e.startswith("timeout after") or e.startswith("node not found")
+        or e.startswith("node spawn") or e.startswith("temp file")
+        for e in errors
+    ) or bool(trace)
     for entry in result.trace:
         if not isinstance(entry, dict):
             continue
