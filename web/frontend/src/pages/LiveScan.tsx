@@ -1,0 +1,133 @@
+import { useEffect, useRef, useState } from "react";
+import { useParams, Link } from "react-router-dom";
+import { motion, AnimatePresence } from "framer-motion";
+import { Radar, Square, ArrowRight, Activity, AlertTriangle, CircleDot } from "lucide-react";
+import { api, wsUrl } from "../lib/api";
+import type { Finding } from "../lib/api";
+
+interface LogLine { text: string; color: string; }
+
+export default function LiveScan() {
+  const { id } = useParams<{ id: string }>();
+  const [logs, setLogs] = useState<LogLine[]>([]);
+  const [findings, setFindings] = useState<Finding[]>([]);
+  const [done, setDone] = useState(false);
+  const termRef = useRef<HTMLDivElement>(null);
+
+  const push = (text: string, color = "text-slate-400") =>
+    setLogs(p => [...p.slice(-300), { text, color }]);
+
+  useEffect(() => {
+    if (!id) return;
+    push("◈ connecting to scan stream…");
+    const ws = new WebSocket(wsUrl(id));
+    ws.onopen = () => push("◈ connected — streaming live events", "text-emerald-400");
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.type === "progress") push("… " + m.data);
+      else if (m.type === "finding") {
+        setFindings(f => [...f, m.data]);
+        push(`● [${m.data.severity.toUpperCase()}] ${m.data.type} — ${m.data.url}`, "text-rose-400");
+      }
+      else if (m.type === "done") { push(`✓ scan complete: ${m.data.findings} findings`, "text-emerald-400"); setDone(true); }
+    };
+    ws.onerror = () => push("✗ websocket error", "text-rose-400");
+    return () => ws.close();
+  }, [id]);
+
+  useEffect(() => { termRef.current?.scrollTo(0, termRef.current.scrollHeight); }, [logs]);
+
+  const cancel = async () => {
+    if (id) { try { await api.cancelScan(id); push("■ cancel requested", "text-amber-400"); } catch (e: any) { push(e.message, "text-rose-400"); } }
+  };
+
+  const crit = findings.filter(f => f.severity === "critical").length;
+  const high = findings.filter(f => f.severity === "high").length;
+
+  return (
+    <div className="min-h-[calc(100vh-4rem)] px-4 sm:px-6 py-10 bg-slate-50">
+      <div className="mx-auto max-w-5xl">
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
+          className="flex flex-wrap items-center gap-3 mb-8">
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-500 shadow-lg shadow-indigo-500/25">
+            <Radar className="h-6 w-6 text-white" />
+          </div>
+          <h1 className="flex-1 text-3xl font-extrabold text-slate-900 tracking-tight">Live scan</h1>
+          {!done && (
+            <span className="flex items-center gap-2 px-4 py-2 rounded-full bg-blue-50 border border-blue-200 text-sm font-semibold text-blue-700">
+              <span className="relative flex h-2.5 w-2.5">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-500" />
+              </span>Scanning
+            </span>
+          )}
+          {done && (
+            <span className="flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-50 border border-emerald-200 text-sm font-semibold text-emerald-700">
+              <CircleDot className="h-4 w-4" />Complete
+            </span>
+          )}
+          {!done && (
+            <button onClick={cancel} className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-rose-700 bg-rose-50 border border-rose-200 hover:bg-rose-100 transition-colors">
+              <Square className="h-4 w-4" />Cancel
+            </button>
+          )}
+          <Link to={`/findings/${id}`} className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white bg-gradient-to-r from-indigo-600 to-violet-600 shadow-lg shadow-indigo-600/25 hover:-translate-y-0.5 transition-all">
+            Findings ({findings.length})<ArrowRight className="h-4 w-4" />
+          </Link>
+        </motion.div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+          {[
+            { icon: Activity, label: "Findings", val: findings.length, c: "text-indigo-600 bg-indigo-50" },
+            { icon: AlertTriangle, label: "Critical", val: crit, c: "text-rose-600 bg-rose-50" },
+            { icon: AlertTriangle, label: "High", val: high, c: "text-orange-600 bg-orange-50" },
+            { icon: CircleDot, label: "Status", val: done ? "done" : "live", c: "text-emerald-600 bg-emerald-50" },
+          ].map((s, i) => (
+            <motion.div key={s.label} initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.07 }}
+              className="glass rounded-2xl p-5 text-center">
+              <div className={`mx-auto mb-2 flex h-9 w-9 items-center justify-center rounded-xl ${s.c}`}>
+                <s.icon className="h-5 w-5" />
+              </div>
+              <div className="text-2xl font-black text-slate-900">{s.val}</div>
+              <div className="text-[11px] font-bold uppercase tracking-widest text-slate-400">{s.label}</div>
+            </motion.div>
+          ))}
+        </div>
+
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15 }}>
+          <div className="rounded-2xl overflow-hidden shadow-xl shadow-slate-900/10 border border-slate-800">
+            <div className="flex items-center gap-2 px-4 py-3 bg-slate-800">
+              <span className="h-3 w-3 rounded-full bg-rose-400" /><span className="h-3 w-3 rounded-full bg-amber-400" /><span className="h-3 w-3 rounded-full bg-emerald-400" />
+              <span className="ml-2 text-xs font-medium text-slate-400">scan output — live</span>
+            </div>
+            <div ref={termRef} className="terminal h-72 overflow-y-auto p-5">
+              {logs.map((l, i) => <div key={i} className={l.color}>{l.text}</div>)}
+              {!done && <span className="inline-block w-2 h-4 bg-emerald-400 animate-pulse ml-1" />}
+            </div>
+          </div>
+        </motion.div>
+
+        <h2 className="text-lg font-bold text-slate-900 mt-10 mb-4">Findings feed</h2>
+        <div className="space-y-2.5">
+          <AnimatePresence>
+            {findings.map(f => (
+              <motion.div key={f.id} initial={{ opacity: 0, x: -30, scale: 0.98 }} animate={{ opacity: 1, x: 0, scale: 1 }}
+                className="glass rounded-2xl p-4 flex items-center gap-3">
+                <span className={`sev-${f.severity} text-[11px] font-extrabold uppercase tracking-wide px-2.5 py-1 rounded-lg`}>{f.severity}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="font-semibold text-slate-900 text-sm">{f.type}</div>
+                  <div className="truncate font-mono text-xs text-slate-400">{f.method} {f.url}</div>
+                </div>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+          {findings.length === 0 && (
+            <div className="glass rounded-2xl p-10 text-center text-sm text-slate-400">
+              No findings yet — they stream in live as modules confirm them.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
