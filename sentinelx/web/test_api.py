@@ -11,13 +11,13 @@ import time
 
 # isolate test DB before importing server
 _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+os.environ["SENTINELX_DB_PATH"] = _tmp.name
 _tmp.close()
 os.environ["SENTINELX_TEST_DB"] = _tmp.name
 
 import sentinelx.web.server as srv
 
 import pathlib
-srv.DB_PATH = pathlib.Path(_tmp.name)
 srv._db = None
 srv.TOKENS.clear()
 srv.SCANS.clear()
@@ -41,11 +41,29 @@ def auth_headers(token):
 def main():
     with TestClient(srv.app) as client:
 
+        def pump(scan_id, headers):
+            # serverless chunked scans: keep pumping until terminal
+            for _ in range(20):
+                r = client.get(f"/api/scans/{scan_id}", headers=headers)
+                st = r.json().get("status") if r.status_code == 200 else None
+                if st in ("completed", "failed", "cancelled"):
+                    return st
+                if st == "chunk_done" or st == "running":
+                    rc = client.post(f"/api/scans/{scan_id}/continue", headers=headers)
+                    if rc.status_code != 200:
+                        time.sleep(0.5)
+                else:
+                    time.sleep(0.5)
+            r = client.get(f"/api/scans/{scan_id}", headers=headers)
+            return r.json().get("status") if r.status_code == 200 else None
+
         def wait_status(scan_id, headers, want=("completed", "failed", "cancelled"), timeout=90):
             for _ in range(int(timeout * 2)):
                 r = client.get(f"/api/scans/{scan_id}", headers=headers)
                 if r.status_code == 200 and r.json()["status"] in want:
                     return r.json()["status"]
+                if r.status_code == 200 and r.json()["status"] == "chunk_done":
+                    return pump(scan_id, headers)
                 time.sleep(0.5)
             return None
 
@@ -116,26 +134,19 @@ def main():
             r = client.get(f"/api/scans/{scan_id}/{suffix}", headers=H)
             check(f"{suffix} 200", r.status_code == 200 and ctype in r.headers.get("content-type", ""), r.text[:100])
 
-        # ---- 7. websocket on finished scan ----
-        try:
-            with client.websocket_connect(f"/ws/scans/{scan_id}?token={token}") as ws:
-                msgs = []
-                for _ in range(600):
-                    m = ws.receive_json()
-                    msgs.append(m["type"])
-                    if m["type"] == "done":
-                        break
-            check("ws streams state+done", "state" in msgs and "done" in msgs,
-                  str(msgs[:12]) + f" ({len(msgs)} msgs)")
-        except Exception as e:  # noqa: BLE001
-            check("ws streams state+done", False, repr(e)[:150])
+        # ---- 7. events feed on finished scan (replaces websocket) ----
+        r = client.get(f"/api/scans/{scan_id}/events?since=0", headers=H)
+        evs = r.json().get("events", []) if r.status_code == 200 else []
+        types = [e["type"] for e in evs]
+        check("events feed has progress/done", "done" in types, str(types[:8]))
 
-        # bad ws token
-        try:
-            with client.websocket_connect(f"/ws/scans/{scan_id}?token=bogus"):
-                check("ws bad token rejected", False, "connected unexpectedly")
-        except Exception:
-            check("ws bad token rejected", True)
+        # websocket removed in serverless port -> polling via /events
+        r = client.get(f"/ws/scans/{scan_id}")
+        check("ws route removed (SPA fallback, not a socket)",
+              r.status_code == 200 and "text/html" in r.headers.get("content-type", ""),
+              str(r.status_code))
+        r = client.get(f"/api/scans/{scan_id}/events?since=0", headers=H)
+        check("events endpoint 200", r.status_code == 200 and "events" in r.json())
 
         # ---- 8. cancel semantics ----
         r = client.post(f"/api/scans/{scan_id}/cancel", headers=H)
@@ -143,26 +154,34 @@ def main():
         r = client.post("/api/scans/doesnotexist/cancel", headers=H)
         check("cancel unknown scan -> 404", r.status_code == 404)
 
-        # ---- 9. cancel a live scan (slow fake run_scan) ----
+        # ---- 9. cancel a live scan (slow chunk in a thread) ----
         import asyncio as _asyncio
+        import threading as _th
+        import sentinelx.engine as _eng
 
-        async def _slow_scan(config, on_finding=None, on_progress=None):
-            if on_progress:
-                on_progress("slow scan running")
-            await _asyncio.sleep(30)
-            return []
+        _orig_stage = _eng.run_stage
 
-        _orig = srv.run_scan
-        srv.run_scan = _slow_scan
-        r = client.post("/api/scans", headers=H, json={"target": "http://127.0.0.1:9", "confirm_own": True,
-                                                       "concurrency": 2, "rate": 5.0, "depth": 0, "timeout": 5.0})
-        slow_id = r.json()["scan_id"]
-        time.sleep(1.0)
+        async def _slow_stage(ctx, stage):
+            if stage == "discovery":
+                await _asyncio.sleep(30)
+            else:
+                await _orig_stage(ctx, stage)
+
+        _eng.run_stage = _slow_stage
+        _uid = srv.db_get_user_by_email("t@t.com")["id"]
+        slow_id = srv._launch_scan(_uid, "http://127.0.0.1:9",
+                                   {"concurrency": 2, "rate": 5.0, "depth": 0,
+                                    "timeout": 5.0, "safe_mode": True})
+        th = _th.Thread(target=lambda: _asyncio.run(srv.run_scan_chunk(slow_id, budget_s=60)))
+        th.start()
+        time.sleep(3.0)
         r = client.post(f"/api/scans/{slow_id}/cancel", headers=H)
         check("cancel running scan 200", r.status_code == 200, r.text[:100])
-        st = wait_status(slow_id, H, want=("cancelled",), timeout=15)
-        check("scan marked cancelled", st == "cancelled", str(st))
-        srv.run_scan = _orig
+        th.join(timeout=60)
+        check("scan marked cancelled",
+              srv._job_get(slow_id)["status"] == "cancelled",
+              str(srv._job_get(slow_id)["status"]))
+        _eng.run_stage = _orig_stage
 
         # ---- 10. rerun + diff ----
         r = client.post(f"/api/scans/{scan_id}/rerun", headers=H)
