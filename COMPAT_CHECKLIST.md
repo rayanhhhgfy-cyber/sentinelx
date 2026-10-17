@@ -41,6 +41,7 @@ Legend: [ ] = not yet verified · [✓] = verified working after changes
 | 30 | `xpath.py` | `scan_endpoint` | XPath injection (error-based, boolean-blind) | [~] |
 | 31 | `xss.py` | `scan_endpoint`, `scan_second_order` | Reflected XSS, stored/second-order XSS | [✓] |
 | 32 | `xxe.py` | `scan_endpoint` | XML external entity injection | [~] |
+| 33 | `apishape.py` | `scan_api_shape` | API request-shape testing: JSON body fields, custom headers, auth bypass, parameter tampering (NEW) | [✓] |
 
 ## Verification log
 
