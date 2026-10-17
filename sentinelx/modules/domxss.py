@@ -40,6 +40,7 @@ class _ScriptExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
         self.scripts: list[str] = []
+        self.script_srcs: list[str] = []   # external JS URLs (same-origin)
         self._buf: list[str] | None = None
         self._skip = False
 
@@ -47,6 +48,7 @@ class _ScriptExtractor(HTMLParser):
         if tag == "script":
             a = dict(attrs)
             if a.get("src"):
+                self.script_srcs.append(a["src"])
                 self._skip = True
                 return
             t = (a.get("type") or "").lower()
@@ -77,6 +79,24 @@ def extract_scripts(html: str) -> list[str]:
     except Exception:
         pass
     return p.scripts
+
+
+def extract_script_srcs(html: str, base_url: str) -> list[str]:
+    """Same-origin external <script src> URLs (discovered, not guessed)."""
+    from urllib.parse import urljoin, urlsplit
+    p = _ScriptExtractor()
+    try:
+        p.feed(html)
+    except Exception:
+        pass
+    base_host = urlsplit(base_url).netloc
+    out = []
+    for src in p.script_srcs:
+        full = urljoin(base_url, src)
+        u = urlsplit(full)
+        if u.scheme in ("http", "https") and u.netloc == base_host:
+            out.append(full.split("#")[0])
+    return out
 
 
 REMEDIATION_DOMXSS = (
@@ -110,6 +130,22 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         return findings
 
     scripts = extract_scripts(html)
+    # ALSO fetch same-origin external scripts: real-world DOM XSS lives in
+    # .js bundles, not inline blocks. Discovered from the page, not guessed.
+    for src_url in extract_script_srcs(html, url)[:10]:
+        try:
+            r = await client.get(src_url, headers=headers)
+            if r and r.status_code == 200:
+                ctype = r.headers.get("content-type", "")
+                if "javascript" in ctype or src_url.endswith(".js"):
+                    try:
+                        body = r.text.strip()
+                    except Exception:
+                        continue
+                    if body and body not in scripts:
+                        scripts.append(body)
+        except Exception:
+            continue
     if not scripts:
         return findings
 
@@ -229,3 +265,8 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 findings.append(f)
 
     return findings
+
+
+# This module analyzes page content (JS), not URL params — it must run on
+# param-less pages too (e.g. "/" loading newsletter.js with DOM XSS).
+scan_endpoint.NEEDS_PARAMS = False

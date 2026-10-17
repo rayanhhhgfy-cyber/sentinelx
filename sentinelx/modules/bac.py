@@ -98,17 +98,20 @@ async def scan_target(client: ScanClient, config: ScanConfig, target: str) -> li
                     ))
 
     jobs = []
-    for p in SENSITIVE_PATHS:
-        jobs.append(check("GET", "/" + p))
-    # method tampering on /admin
-    for m in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"):
-        jobs.append(check(m, "/admin"))
-    # header bypasses
-    for hb in HEADER_BYPASSES:
-        jobs.append(check("GET", "/admin", hb))
+    if not config.no_wordlist:
+        for p in SENSITIVE_PATHS:
+            jobs.append(check("GET", "/" + p))
+        # method tampering on /admin
+        for m in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"):
+            jobs.append(check(m, "/admin"))
+    # header bypasses (tested against discovered admin paths, not guessed)
+    # header bypasses (tested against discovered admin paths, not guessed)
     # path tricks
-    for t in PATH_TRICKS:
-        jobs.append(check("GET", t))
+    if not config.no_wordlist:
+        for hb in HEADER_BYPASSES:
+            jobs.append(check("GET", "/admin", hb))
+        for t in PATH_TRICKS:
+            jobs.append(check("GET", t))
     # --- method override: 403 -> 200 differential ---
     # Some frameworks honor X-HTTP-Method-Override or _method param to bypass
     # method-based access control. First establish the 403 baseline, then try

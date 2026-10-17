@@ -70,3 +70,7 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 references=["https://owasp.org/API-Security/editions/2023/en/0x11-t10/"],
             ))
     return findings
+
+
+# Path-based API ID enumeration works without query params.
+scan_endpoint.NEEDS_PARAMS = False

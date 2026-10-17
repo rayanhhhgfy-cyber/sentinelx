@@ -44,6 +44,17 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         return findings
 
     headers = {"User-Agent": config.user_agent}
+
+    # BASELINE: JWT bypass tests are only meaningful if the endpoint actually
+    # enforces authentication. If it returns 200 with NO token at all, there
+    # is no JWT validation to bypass (that's missing-auth, not a JWT flaw).
+    try:
+        baseline = await client.get(url, headers=headers, dedupe=False)
+    except Exception:
+        baseline = None
+    if not baseline or baseline.status_code not in (401, 403):
+        return findings  # no auth enforced → JWT attacks meaningless here
+
     # craft test tokens (we test the endpoint's validation, not a real session)
     hdr_none = b64u(json.dumps({"alg": "none", "typ": "JWT"}).encode())
     body = b64u(json.dumps({"sub": "sx-test", "role": "admin"}).encode())

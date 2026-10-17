@@ -73,6 +73,8 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     target_host = urlsplit(config.target).hostname or ""
     if not target_host or target_host in ("127.0.0.1", "localhost"):
         return findings  # no DNS takeover possible on localhost
+    if config.no_wordlist:
+        return findings  # subdomain enumeration is guessing; needs --wordlist
 
     try:
         import dns.resolver  # type: ignore
