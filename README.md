@@ -70,24 +70,6 @@ Plus: async crawler (links, forms, JS endpoints, robots.txt), param extraction.
 --webhook-kind K    slack | discord | generic
 ```
 
-## Web UI
-
-```bash
-# install everything (scanner + web backend)
-.venv/bin/pip install -r requirements.txt
-
-# build the frontend (backend serves web/frontend/dist directly)
-cd web/frontend && npm install && npm run build && cd ../..
-
-# start the backend
-.venv/bin/python -m sentinelx.web.run
-# open http://127.0.0.1:8000
-```
-
-Full-stack web app: FastAPI backend (REST + SQLite/Postgres + auth)
-with a responsive SPA frontend — start scans, watch live findings stream
-via polling, browse reports, manage history. Register an account in the UI first.
-
 ## Test target
 
 A deliberately vulnerable demo app lives in `target/app.py` (Flask).
