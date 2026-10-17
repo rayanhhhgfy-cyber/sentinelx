@@ -59,14 +59,50 @@ def _evidence(method, url, req_headers, body_sent, resp) -> Evidence:
 
 
 def _numeric_variants(original: str) -> list[str]:
-    """±1, ±10, 0, -1 variants of a numeric id."""
+    """±1, ±10, 0, -1, encoding and boundary variants of a numeric id."""
     try:
         n = int(original)
     except (ValueError, TypeError):
         return []
-    variants = {str(n + 1), str(n - 1), str(n + 10), str(n - 10), "0", "-1"}
+    variants = {str(n + 1), str(n - 1), str(n + 10), str(n - 10), "0", "-1",
+                str(n + 2), str(n - 2), "1", "2"}
     variants.discard(original)
-    return sorted(variants, key=lambda v: abs(int(v) - n))
+    out = sorted(variants, key=lambda v: abs(int(v) - n))
+    # --- TECHNIQUE: encoded numeric forms ---
+    out += [f"{n:05d}", f"+{n}", f"{n}.0", f"0x{n:x}"]
+    # --- TECHNIQUE: boundary values ---
+    out += ["2147483647", "999999999", "1000000"]
+    # --- TECHNIQUE: negative / zero edge ---
+    out += ["-0", "00", "01"]
+    return out
+
+
+def _string_id_variants(original: str) -> list[str]:
+    """Techniques for opaque string IDs: case, truncation, suffix games."""
+    o = original.strip()
+    variants = []
+    # --- TECHNIQUE: case flip ---
+    variants.append(o.swapcase())
+    variants.append(o.lower())
+    variants.append(o.upper())
+    # --- TECHNIQUE: truncation / extension ---
+    if len(o) > 2:
+        variants.append(o[:-1])
+        variants.append(o + "1")
+        variants.append(o + "0")
+    # --- TECHNIQUE: common suffixes ---
+    for suffix in ("-test", "_test", "-dev", "1", "2", "-backup"):
+        variants.append(o + suffix)
+    # --- TECHNIQUE: URL-encoding ---
+    import urllib.parse as _up
+    variants.append(_up.quote(o, safe=""))
+    variants.append(_up.quote(_up.quote(o, safe=""), safe=""))
+    # --- TECHNIQUE: null byte / truncation ---
+    variants.append(o + "%00")
+    # --- TECHNIQUE: whitespace ---
+    variants.append(o + " ")
+    variants.append(" " + o)
+    return [v for v in variants if v != original]
 
 
 def _uuid_variants(original: str) -> list[str]:
@@ -116,6 +152,9 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         if not variants:
             variants = _timestamp_variants(params[param])
             variant_kind = "timestamp-enumeration"
+        if not variants:
+            variants = _string_id_variants(params[param])
+            variant_kind = "string-id-enumeration"
         if not variants:
             continue
         # baseline: 2 samples, must be stable and 200
