@@ -236,3 +236,8 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 ))
 
     return findings
+
+
+# Path-based ID enumeration (e.g. /api/clients/1 -> /api/clients/2) works
+# without query params.
+scan_endpoint.NEEDS_PARAMS = False

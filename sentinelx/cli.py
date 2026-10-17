@@ -48,6 +48,12 @@ def parse_args(argv=None):
     p.add_argument("--webhook-kind", default="generic", choices=["slack", "discord", "generic"])
     p.add_argument("--max-pages", type=int, default=50, help="max pages to crawl")
     p.add_argument("--no-smart", action="store_true", help="disable smart mode (tech-tuned payloads, priority queue)")
+    p.add_argument("--wordlist", action="store_true",
+                   help="enable wordlist guessing (directory bruteforce). OFF by default: "
+                        "the scanner discovers attack surface dynamically (crawl, JS, robots, "
+                        "sitemap, API specs) and never guesses paths unless you ask it to.")
+    p.add_argument("--no-wordlist", action="store_true",
+                   help="deprecated: dynamic-only discovery is now the default behavior")
     return p.parse_args(argv)
 
 
@@ -98,6 +104,7 @@ def main(argv=None) -> int:
         rate_per_sec=args.rate, crawl_depth=args.depth, timeout=args.timeout,
         oob_domain=args.oob_domain, auth_a=args.auth_a, auth_b=args.auth_b,
         max_pages=args.max_pages, smart=not args.no_smart,
+        no_wordlist=not args.wordlist,  # --no-wordlist is deprecated (now default)
     )
     unsafe = args.unsafe
 

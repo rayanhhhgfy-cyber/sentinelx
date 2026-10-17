@@ -157,17 +157,153 @@ async def scan_dirfuzz(client: ScanClient, config: ScanConfig, url: str) -> list
                     request_raw=raw_request("GET", full, headers, None),
                     response_raw=raw_response(resp.status_code, dict(resp.headers),
                                               resp.content[:2000]),
-                    proof=f"HTTP 200, {len(resp.content)} bytes at /{path} (differs from 404 baseline)",
+                    proof=f"HTTP 200, {len(resp.content)} bytes at /{path} (differs from 404 baseline). "
+                          f"NOTE: found via wordlist guessing, not linked from the site — verify manually.",
                 )
-                findings.append(Finding(
-                    type="Sensitive Path Exposure", subtype=f"path:/{path}",
+                f = Finding(
+                    type="Sensitive Path Exposure", subtype=f"wordlist:path:/{path}",
                     cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
                     confidence=0.7, url=full, method="GET", param="",
                     payload=f"/{path}", evidence=ev, cwe="CWE-538",
                     owasp="A05:2021 – Security Misconfiguration",
                     remediation="Remove or protect sensitive paths; block /.git, /.env, backups at the edge.",
                     references=["https://owasp.org/www-project-web-security-testing-guide/"],
-                ))
+                )
+                # Wordlist-based: lower confidence, clearly labeled. Dynamic
+                # discovery (crawl/js/robots/sitemap) always outranks guessing.
+                f.set_confidence("LOW")
+                findings.append(f)
 
     await asyncio.gather(*[probe(p) for p in ADMIN_PATHS])
     return findings
+
+
+# Sensitive file patterns — checked ONLY against URLs the crawler actually
+# discovered (comment mining, JS, links). This is verification, not guessing:
+# dirfuzz (wordlist) is the guessing path and is disabled by default.
+SENSITIVE_FILE_RES = [
+    (re.compile(r"\.git/HEAD$", re.I), "Git metadata exposed", "CWE-538"),
+    (re.compile(r"\.env$", re.I), "Environment file exposed", "CWE-538"),
+    (re.compile(r"backup\.(zip|sql|tar\.gz|bak)$", re.I), "Backup file exposed", "CWE-538"),
+    (re.compile(r"\.sql$", re.I), "SQL dump exposed", "CWE-538"),
+    (re.compile(r"\.svn/entries$", re.I), "SVN metadata exposed", "CWE-538"),
+    (re.compile(r"server\.key$", re.I), "Private key exposed", "CWE-798"),
+    (re.compile(r"\.DS_Store$", re.I), "DS_Store exposed", "CWE-538"),
+    (re.compile(r"web\.config$", re.I), "Web config exposed", "CWE-538"),
+]
+
+
+async def scan_sensitive_file(client: ScanClient, config: ScanConfig,
+                              method: str, url: str, params: dict) -> list[Finding]:
+    """Verify dynamically-discovered sensitive files (not a wordlist)."""
+    findings = []
+    if method.upper() != "GET":
+        return findings
+    path = urlsplit(url).path
+    matched = None
+    for rx, label, cwe in SENSITIVE_FILE_RES:
+        if rx.search(path):
+            matched = (label, cwe)
+            break
+    if not matched:
+        return findings
+    label, cwe = matched
+    try:
+        resp = await client.get(url, headers={"User-Agent": config.user_agent})
+    except Exception:
+        return findings
+    if not resp or resp.status_code != 200 or len(resp.content) < 10:
+        return findings
+    # content sanity: .git/HEAD should look like a git ref
+    if path.endswith("/HEAD") and b"ref:" not in resp.content[:100]:
+        return findings
+    ev = Evidence(
+        request_raw=raw_request("GET", url, {"User-Agent": config.user_agent}, None),
+        response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content[:500]),
+        proof=f"{label}: {path} returned HTTP 200 ({len(resp.content)} bytes). "
+              f"Discovered dynamically from site content, not guessed.",
+    )
+    f = Finding(
+        type="Sensitive Data Exposure", subtype=f"sensitive-file:{path}",
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        confidence=0.9, url=url, method="GET", param="",
+        evidence=ev, cwe=cwe,
+        owasp="A05:2021 – Security Misconfiguration",
+        remediation="Remove sensitive files from the web root; block them at the edge.",
+        references=["https://owasp.org/www-project-web-security-testing-guide/"],
+    )
+    f.set_confidence("HIGH")
+    findings.append(f)
+    return findings
+
+
+# Page-content module: verifies discovered files, needs no params.
+scan_sensitive_file.NEEDS_PARAMS = False
+
+
+# ---------------------------------------------------------------------------
+# Exposed sensitive API: dynamically-discovered API endpoints whose path
+# suggests internal use AND whose response contains sensitive data.
+# Two signals required (path keyword + sensitive keys) to avoid FPs.
+# ---------------------------------------------------------------------------
+SENSITIVE_API_PATH_RES = [
+    re.compile(r"/(internal|admin|private|debug|metrics|config|backup)(/|$)", re.I),
+]
+SENSITIVE_DATA_KEYS = [
+    "password", "passwd", "secret", "api_key", "apikey", "db_host",
+    "db_password", "revenue", "salary", "ssn", "credit_card", "internal_notes",
+    "private_key", "auth_token",
+]
+
+
+async def scan_exposed_api(client: ScanClient, config: ScanConfig,
+                           method: str, url: str, params: dict) -> list[Finding]:
+    findings = []
+    if method.upper() != "GET" or "/api/" not in url:
+        return findings
+    path = urlsplit(url).path
+    if not any(rx.search(path) for rx in SENSITIVE_API_PATH_RES):
+        return findings
+    try:
+        resp = await client.get(url, headers={"User-Agent": config.user_agent})
+    except Exception:
+        return findings
+    if not resp or resp.status_code != 200:
+        return findings
+    ctype = resp.headers.get("content-type", "")
+    if "json" not in ctype:
+        return findings
+    try:
+        import json as _json
+        data = _json.loads(resp.text)
+    except Exception:
+        return findings
+    if not isinstance(data, dict):
+        return findings
+    hit_keys = [k for k in data.keys()
+                if any(s in k.lower() for s in SENSITIVE_DATA_KEYS)]
+    if not hit_keys:
+        return findings
+    ev = Evidence(
+        request_raw=raw_request("GET", url, {"User-Agent": config.user_agent}, None),
+        response_raw=raw_response(resp.status_code, dict(resp.headers),
+                                  resp.content[:1000]),
+        proof=f"Unauthenticated internal API exposes sensitive fields: "
+              f"{', '.join(hit_keys)}. No Authorization required (HTTP 200).",
+    )
+    f = Finding(
+        type="Sensitive Data Exposure", subtype="exposed-internal-api",
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        confidence=0.85, url=url, method="GET", param="",
+        evidence=ev, cwe="CWE-200",
+        owasp="A01:2021 – Broken Access Control",
+        remediation="Require authentication on internal APIs; never expose "
+                    "infrastructure details (db hosts) or business data publicly.",
+        references=["https://owasp.org/API-Security/editions/2023/en/0x11-t01/"],
+    )
+    f.set_confidence("HIGH")
+    findings.append(f)
+    return findings
+
+
+scan_exposed_api.NEEDS_PARAMS = False
