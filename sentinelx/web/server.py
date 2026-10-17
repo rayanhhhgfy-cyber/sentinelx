@@ -1,4 +1,4 @@
-"""SentinelX web backend — FastAPI REST API + WebSocket + background scan jobs.
+"""SentinelX web backend — FastAPI REST API + chunked serverless scan jobs.
 
 Run:  python -m sentinelx.web.run   (or uvicorn sentinelx.web.server:app)
 """
@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import secrets
-import sqlite3
+from sentinelx.web.dbcompat import db, is_postgres, OperationalError, IntegrityError
 import tempfile
 import threading
 import time
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,15 +44,8 @@ ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = ROOT / "sentinelx.db"
 
 _db_lock = threading.Lock()
-_db: Optional[sqlite3.Connection] = None
-
-
-def db() -> sqlite3.Connection:
-    global _db
-    if _db is None:
-        _db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        _db.row_factory = sqlite3.Row
-    return _db
+# db() comes from sentinelx.web.dbcompat: Postgres when DATABASE_URL is set,
+# SQLite file fallback for local dev. Same call pattern everywhere.
 
 
 def init_db():
@@ -75,8 +68,8 @@ def init_db():
         # role column (migration for existing DBs)
         try:
             c.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'member'")
-        except sqlite3.OperationalError:
-            pass
+        except Exception:
+            pass  # column already exists (sqlite + postgres)
         # ---- extended feature tables ----
         c.execute("""CREATE TABLE IF NOT EXISTS templates(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
@@ -141,8 +134,20 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_notes_finding ON finding_notes(finding_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_comments_scan ON scan_comments(scan_id)")
+        c.execute("""CREATE TABLE IF NOT EXISTS scan_jobs(
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+            target TEXT NOT NULL, config_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            stage_idx INTEGER DEFAULT 0, checkpoint_json TEXT DEFAULT '{}',
+            created_at REAL NOT NULL, updated_at REAL NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS scan_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT NOT NULL,
+            seq INTEGER NOT NULL, type TEXT NOT NULL,
+            data_json TEXT DEFAULT '{}', created_at REAL NOT NULL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON scan_jobs(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_scan ON scan_events(scan_id, seq)")
         c.commit()
-    log.info("database ready at %s", DB_PATH)
+    log.info("database ready")
 
 
 # ---------------------------------------------------------------- auth
@@ -176,7 +181,7 @@ def db_create_user(email: str, name: str, pw: str, role: str = "member") -> dict
                 "INSERT INTO users(email,name,pw_hash,created_at,role) VALUES(?,?,?,?,?)",
                 (email.lower().strip(), name.strip(), hash_pw(pw), time.time(), use_role))
             c.commit()
-        except sqlite3.IntegrityError:
+        except IntegrityError:
             raise HTTPException(400, "email already registered")
         uid = cur.lastrowid
         row = c.execute("SELECT id,email,name,created_at,role FROM users WHERE id=?", (uid,)).fetchone()
@@ -190,7 +195,7 @@ def db_get_user(uid: int) -> Optional[dict]:
         return dict(row) if row else None
 
 
-def db_get_user_by_email(email: str) -> Optional[sqlite3.Row]:
+def db_get_user_by_email(email: str) -> Optional[dict]:
     with _db_lock:
         return db().execute(
             "SELECT * FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
@@ -249,14 +254,6 @@ def _require_scan_write(user: dict):
 def _require_admin(user: dict):
     if _user_role(user) != "admin":
         raise HTTPException(403, "admin only")
-
-
-def ws_token(ws: WebSocket) -> int:
-    tok = ws.query_params.get("token", "")
-    uid = TOKENS.get(tok)
-    if not uid:
-        raise HTTPException(401, "invalid token")
-    return uid
 
 
 # ---------------------------------------------------------------- scan store
@@ -444,19 +441,90 @@ def _scan_summary(row: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------- background scans
+# ---------------------------------------------------------------- chunked scans (serverless)
+#
+# Scans run as chained chunks: each invocation (API call or cron tick) runs
+# scan stages for ~CHUNK_BUDGET_S seconds, persists a checkpoint to the
+# scan_jobs table, then returns. The frontend polls and triggers the next
+# chunk via POST /api/scans/{id}/continue until status=completed.
 
-SCANS: dict[str, dict] = {}  # scan_id -> {task, queue, events, status, ...}
+SCANS: dict[str, dict] = {}  # legacy compat shim (no longer used for state)
+
+CHUNK_BUDGET_S = 240.0
 
 
 SLA_DAYS = {"critical": 7, "high": 30, "medium": 90, "low": 180}
 
 
-async def _run_scan_job(scan_id: str, user_id: int, target: str, cfg: dict):
-    state = SCANS.get(scan_id)
-    if not state:
-        return
-    queue: asyncio.Queue = state["queue"]
+def _job_get(scan_id: str) -> dict | None:
+    with _db_lock:
+        row = db().execute("SELECT * FROM scan_jobs WHERE id=?", (scan_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def _job_claim(scan_id: str) -> bool:
+    """Atomically claim a queued/chunk_done job for execution."""
+    with _db_lock:
+        cur = db().execute(
+            "UPDATE scan_jobs SET status='running', updated_at=? "
+            "WHERE id=? AND status IN ('queued','chunk_done')",
+            (time.time(), scan_id))
+        db().commit()
+        return cur.rowcount > 0
+
+
+def _job_set_status(scan_id: str, status: str, stage_idx=None, checkpoint=None):
+    with _db_lock:
+        if stage_idx is not None:
+            db().execute(
+                "UPDATE scan_jobs SET status=?, stage_idx=?, checkpoint_json=?, updated_at=? WHERE id=?",
+                (status, stage_idx, json.dumps(checkpoint or {}), time.time(), scan_id))
+        else:
+            db().execute("UPDATE scan_jobs SET status=?, updated_at=? WHERE id=?",
+                         (status, time.time(), scan_id))
+        db().commit()
+
+
+def _job_should_stop(scan_id: str) -> bool:
+    """True when an operator (or failure) moved the job out of an active state."""
+    job = _job_get(scan_id)
+    return not job or job["status"] not in ("running", "chunk_done", "queued")
+
+
+def _emit_event(scan_id: str, ev_type: str, data: dict):
+    with _db_lock:
+        row = db().execute(
+            "SELECT COALESCE(MAX(seq),0) AS m FROM scan_events WHERE scan_id=?",
+            (scan_id,)).fetchone()
+        seq = (row["m"] or 0) + 1
+        db().execute(
+            "INSERT INTO scan_events(scan_id,seq,type,data_json,created_at) VALUES(?,?,?,?,?)",
+            (scan_id, seq, ev_type, json.dumps(data), time.time()))
+        db().commit()
+
+
+async def run_scan_chunk(scan_id: str, budget_s: float = CHUNK_BUDGET_S) -> dict:
+    """Run one chunk of a scan. Returns {"status": ..., "chunk": "done"|"more"}."""
+    from sentinelx.core.http import ScanClient, ScanConfig, DEFAULT_UA
+    from sentinelx.engine import STAGES, ScanCtx, run_stage, run_endpoints_slice, _tracked_client
+
+    if not _job_claim(scan_id):
+        job = _job_get(scan_id)
+        return {"status": (job or {}).get("status", "unknown"), "chunk": "skipped"}
+
+    job = _job_get(scan_id)
+    user_id, target = job["user_id"], job["target"]
+    cfg = json.loads(job["config_json"] or "{}")
+    cp = json.loads(job["checkpoint_json"] or "{}")
+    stage_idx = int(job.get("stage_idx") or 0)
+    deadline = time.monotonic() + budget_s
+
+    # rebuild dedup state from findings already in DB (findings parity across chunks)
+    existing = db_list_findings(scan_id)
+    seen_keys = set(cp.get("seen_keys") or [])
+    for fd in existing:
+        seen_keys.add(_dedup_key_of(fd))
+
     stats_bucket: dict = {}
     config = ScanConfig(
         target=target,
@@ -470,87 +538,114 @@ async def _run_scan_job(scan_id: str, user_id: int, target: str, cfg: dict):
         custom_headers=cfg.get("custom_headers") or {},
         custom_cookies=cfg.get("custom_cookies") or {},
         exclude_paths=cfg.get("exclude_paths") or [],
-        pause_event=state.get("pause_event"),
         stats=stats_bucket,
     )
 
-    def emit_event(ev: dict):
-        state["events"].append(ev)
-        if len(state["events"]) > 500:
-            state["events"] = state["events"][-500:]
-        queue.put_nowait(ev)
-
-    def on_finding(f: Finding):
+    def on_finding(f):
         fd = f.to_dict()
         db_id = db_add_finding(scan_id, fd)
         fd["_db_id"] = db_id
-        state["findings"].append(fd)
-        emit_event({"type": "finding", "data": {
+        _emit_event(scan_id, "finding", {
             "id": f.id, "db_id": db_id, "type": f.type, "subtype": f.subtype,
             "severity": f.severity, "cvss_score": f.cvss_score,
             "confidence": f.confidence, "url": f.url, "method": f.method,
             "param": f.param,
-        }})
+        })
 
     def on_progress(msg: str):
-        emit_event({"type": "progress", "data": msg})
-        if msg.startswith("done:"):
-            try:
-                parts = msg.split(",")
-                req = int(parts[1].strip().split()[0])
-                state["stats"]["requests"] = req
-            except Exception:
-                pass
+        _emit_event(scan_id, "progress", msg)
 
-    # authenticated scans: perform the profile login first, reuse its cookies
-    if cfg.get("auth_profile_id"):
-        try:
-            prof_cookies = await _profile_login(user_id, int(cfg["auth_profile_id"]))
-            if prof_cookies:
-                merged = dict(config.custom_cookies or {})
-                merged.update(prof_cookies)
-                config.custom_cookies = merged
-                emit_event({"type": "progress",
-                            "data": "auth profile login ok, session cookies captured"})
-        except Exception as e:  # noqa: BLE001
-            emit_event({"type": "progress",
-                        "data": f"auth profile login failed: {str(e)[:200]}"})
-            log.warning("scan %s auth profile login failed: %s", scan_id, e)
+    # authenticated scans: login per chunk (cheap, keeps cookies fresh)
+    async def _do_auth_login():
+        if cfg.get("auth_profile_id"):
+            try:
+                prof_cookies = await _profile_login(user_id, int(cfg["auth_profile_id"]))
+                if prof_cookies:
+                    merged = dict(config.custom_cookies or {})
+                    merged.update(prof_cookies)
+                    config.custom_cookies = merged
+                    on_progress("auth profile login ok, session cookies captured")
+            except Exception as e:  # noqa: BLE001
+                on_progress(f"auth profile login failed: {str(e)[:200]}")
+                log.warning("scan %s auth profile login failed: %s", scan_id, e)
 
     db_set_scan_status(scan_id, "running")
-    state["status"] = "running"
-    emit_event({"type": "progress", "data": f"scan started: {target}"})
+    _emit_event(scan_id, "progress", f"scan chunk started: {target} (stage {stage_idx})")
+
     try:
-        findings = await run_scan(config, on_finding=on_finding, on_progress=on_progress)
-        finished = time.time()
-        stats = {"requests": state["stats"].get("requests", 0),
-                 "counts": _severity_counts(state["findings"])}
-        db_set_scan_status(scan_id, "completed", stats)
-        state["status"] = "completed"
-        state["stats"].update(stats)
-        # SLA due dates + engine stats, persisted for the API
-        _apply_sla_and_stats(scan_id, state["findings"], finished, stats_bucket)
-        emit_event({"type": "done", "data": {"status": "completed",
-                                             "findings": len(findings)}})
-        log.info("scan %s completed: %d findings", scan_id, len(findings))
-        await _fire_notifications(user_id, "scan_completed", {
-            "scan_id": scan_id, "target": target,
-            "findings": len(findings), "counts": stats["counts"],
-        })
+        async with ScanClient(config) as client:
+            await _do_auth_login()
+            ctx = ScanCtx(client=client, config=config, emit=on_finding, progress=on_progress)
+            _tracked_client(client, config, ctx)
+            # restore checkpoint state
+            ctx.seen = seen_keys
+            ctx.seq = len(existing)
+            ctx.endpoints = cp.get("endpoints") or []
+            ctx.mod_stats = dict(cp.get("mod_stats") or {})
+
+            idx = stage_idx
+            while idx < len(STAGES):
+                if _job_should_stop(scan_id):
+                    _save_chunk_checkpoint(scan_id, idx, ctx, {"ep_cursor": cp.get("ep_cursor", 0)})
+                    return {"status": _job_get(scan_id)["status"], "chunk": "stopped"}
+                stage = STAGES[idx]
+                if stage == "endpoints":
+                    start_ep = int(cp.get("ep_cursor") or 0)
+                    next_ep, done = await run_endpoints_slice(ctx, start_ep, deadline)
+                    cp["ep_cursor"] = next_ep
+                    cp.update(ctx.checkpoint())
+                    if not done:
+                        _save_chunk_checkpoint(scan_id, idx, ctx, cp)
+                        return {"status": "chunk_done", "chunk": "more"}
+                    cp["ep_cursor"] = 0
+                else:
+                    await run_stage(ctx, stage)
+                    cp.update(ctx.checkpoint())
+                idx += 1
+                _save_chunk_checkpoint(scan_id, idx, ctx, cp)
+                if time.monotonic() >= deadline:
+                    _job_set_status(scan_id, "chunk_done", idx, cp)
+                    db_set_scan_status(scan_id, "running")
+                    return {"status": "chunk_done", "chunk": "more"}
+
+            # ---- all stages complete: finalize ----
+            finished = time.time()
+            findings = db_list_findings(scan_id)
+            stats = {"requests": sum((ctx.mod_stats or {}).values()),
+                     "counts": _severity_counts(findings)}
+            db_set_scan_status(scan_id, "completed", stats)
+            _job_set_status(scan_id, "completed", len(STAGES), cp)
+            stats_bucket["modules"] = dict(ctx.mod_stats)
+            _apply_sla_and_stats(scan_id, findings, finished, stats_bucket)
+            _emit_event(scan_id, "done", {"status": "completed", "findings": len(findings)})
+            log.info("scan %s completed: %d findings", scan_id, len(findings))
+            await _fire_notifications(user_id, "scan_completed", {
+                "scan_id": scan_id, "target": target,
+                "findings": len(findings), "counts": stats["counts"],
+            })
+            return {"status": "completed", "chunk": "done"}
     except asyncio.CancelledError:
-        db_set_scan_status(scan_id, "cancelled")
-        state["status"] = "cancelled"
-        emit_event({"type": "done", "data": {"status": "cancelled"}})
-        log.info("scan %s cancelled", scan_id)
         raise
     except Exception as e:  # noqa: BLE001
         db_set_scan_status(scan_id, "failed", {"error": str(e)[:500]})
-        state["status"] = "failed"
-        emit_event({"type": "done", "data": {"status": "failed", "error": str(e)[:500]}})
-        log.error("scan %s failed: %s", scan_id, e)
+        _job_set_status(scan_id, "failed")
+        _emit_event(scan_id, "done", {"status": "failed", "error": str(e)[:500]})
+        log.error("scan %s chunk failed: %s", scan_id, e)
         await _fire_notifications(user_id, "scan_failed", {
             "scan_id": scan_id, "target": target, "error": str(e)[:500],
         })
+        return {"status": "failed", "chunk": "done"}
+
+
+def _save_chunk_checkpoint(scan_id: str, stage_idx: int, ctx, cp: dict):
+    # never clobber an operator-set terminal/paused status
+    job = _job_get(scan_id)
+    if job and job["status"] not in ("running", "chunk_done", "queued"):
+        return
+    cp = dict(cp or {})
+    cp.update(ctx.checkpoint())
+    _job_set_status(scan_id, "chunk_done", stage_idx, cp)
+    db_set_scan_status(scan_id, "running")
 
 
 def _apply_sla_and_stats(scan_id: str, findings: list[dict], finished_at: float,
@@ -588,6 +683,10 @@ def _fernet():
         return _FERNET
     from cryptography.fernet import Fernet
     key = os.environ.get("SENTINELX_FERNET_KEY", "")
+    if not key and os.environ.get("VERCEL"):
+        raise RuntimeError(
+            "SENTINELX_FERNET_KEY must be set in production (Vercel): "
+            "auth-profile passwords cannot be decrypted otherwise")
     if not key:
         key = Fernet.generate_key().decode()
         log.warning("SENTINELX_FERNET_KEY not set — generated ephemeral key; "
@@ -772,34 +871,39 @@ def _expire_risk_acceptances():
             log.info("expired %d risk acceptances", len(rows))
 
 
-async def _scheduler_loop():
-    while True:
+async def _pump_active_jobs(budget_s: float = 120.0):
+    """Cron helper: run one chunk for each job awaiting execution."""
+    deadline = time.monotonic() + budget_s
+    with _db_lock:
+        rows = db().execute(
+            "SELECT id FROM scan_jobs WHERE status IN ('queued','chunk_done') "
+            "ORDER BY updated_at LIMIT 10").fetchall()
+    for r in rows:
+        if time.monotonic() >= deadline:
+            break
         try:
-            await _run_due_schedules()
-            _expire_risk_acceptances()
+            await run_scan_chunk(r["id"], budget_s=min(240.0, deadline - time.monotonic()))
         except Exception as e:  # noqa: BLE001
-            log.warning("scheduler tick failed: %s", e)
-        await asyncio.sleep(60)
+            log.warning("cron chunk for %s failed: %s", r["id"], e)
 
 
 def _launch_scan(user_id: int, target: str, cfg: dict) -> str:
+    """Create scan + job rows. The caller (or cron) pumps chunks via run_scan_chunk."""
     scan_id = secrets.token_hex(8)
     db_create_scan(scan_id, user_id, target, cfg)
-    pause_event = asyncio.Event()
-    pause_event.set()
-    SCANS[scan_id] = {
-        "task": None, "queue": asyncio.Queue(), "events": [],
-        "status": "queued", "findings": [], "stats": {},
-        "target": target, "config": cfg, "user_id": user_id,
-        "pause_event": pause_event,
-    }
-    SCANS[scan_id]["task"] = asyncio.create_task(_run_scan_job(scan_id, user_id, target, cfg))
-    log.info("scan %s queued for %s", scan_id, target)
-    # keep saved-target bookkeeping fresh
+    now = time.time()
     with _db_lock:
-        db().execute("UPDATE targets SET last_scan_at=? WHERE user_id=? AND url=?",
-                     (time.time(), user_id, target))
+        db().execute(
+            "INSERT INTO scan_jobs(id,user_id,target,config_json,status,stage_idx,"
+            "checkpoint_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (scan_id, user_id, target, json.dumps(cfg), "queued", 0, "{}",
+             now, now))
         db().commit()
+        # keep saved-target bookkeeping fresh
+        db().execute("UPDATE targets SET last_scan_at=? WHERE user_id=? AND url=?",
+                     (now, user_id, target))
+        db().commit()
+    log.info("scan %s queued for %s", scan_id, target)
     return scan_id
 
 
@@ -844,15 +948,31 @@ app.add_middleware(
 @app.on_event("startup")
 async def _startup():
     init_db()
-    app.state.scheduler_task = asyncio.create_task(_scheduler_loop())
-    log.info("scheduler loop started")
+    log.info("startup complete (serverless: no in-process scheduler)")
 
 
-@app.on_event("shutdown")
-async def _shutdown():
-    task = getattr(app.state, "scheduler_task", None)
-    if task:
-        task.cancel()
+@app.post("/api/cron/tick")
+async def cron_tick(request: Request):
+    """Vercel Cron entrypoint (every 5 min). Protected by CRON_SECRET."""
+    secret = os.environ.get("CRON_SECRET", "")
+    got = request.headers.get("x-cron-secret", "")
+    # Vercel also sends its own Authorization header for cron; accept either
+    auth = request.headers.get("authorization", "")
+    if not secret or (got != secret and auth != f"Bearer {secret}"):
+        raise HTTPException(401, "invalid cron secret")
+    try:
+        await _run_due_schedules()
+    except Exception as e:  # noqa: BLE001
+        log.warning("cron schedules failed: %s", e)
+    try:
+        _expire_risk_acceptances()
+    except Exception as e:  # noqa: BLE001
+        log.warning("cron risk expiry failed: %s", e)
+    try:
+        await _pump_active_jobs()
+    except Exception as e:  # noqa: BLE001
+        log.warning("cron pump failed: %s", e)
+    return {"ok": True}
 
 
 _START_TIME = time.time()
@@ -1007,7 +1127,9 @@ async def start_scan(body: ScanStartIn, request: Request):
         cfg["auth_profile_id"] = body.auth_profile_id
     scan_id = _launch_scan(user["id"], target, cfg)
     _audit(user["id"], "scan_create", "scan", scan_id, f"target={target}")
-    return {"scan_id": scan_id, "status": "queued"}
+    # run the first chunk inline (serverless: each invocation gets ~240s of scan time)
+    result = await run_scan_chunk(scan_id)
+    return {"scan_id": scan_id, "status": result["status"]}
 
 
 @app.get("/api/scans")
@@ -1123,10 +1245,12 @@ async def cancel_scan(scan_id: str, request: Request):
     user = await current_user(request)
     _require_scan_write(user)
     _require_scan(scan_id, user["id"])
-    state = SCANS.get(scan_id)
-    if not state or not state.get("task") or state["task"].done():
+    job = _job_get(scan_id)
+    if not job or job["status"] in ("completed", "failed", "cancelled"):
         raise HTTPException(400, "scan is not running")
-    state["task"].cancel()
+    _job_set_status(scan_id, "cancelled")
+    db_set_scan_status(scan_id, "cancelled")
+    _emit_event(scan_id, "done", {"status": "cancelled"})
     _audit(user["id"], "scan_cancel", "scan", scan_id, "")
     return {"cancelled": True}
 
@@ -1136,15 +1260,11 @@ async def pause_scan(scan_id: str, request: Request):
     user = await current_user(request)
     _require_scan_write(user)
     _require_scan(scan_id, user["id"])
-    state = SCANS.get(scan_id)
-    if not state or state.get("status") != "running":
+    job = _job_get(scan_id)
+    if not job or job["status"] not in ("running", "chunk_done", "queued"):
         raise HTTPException(400, "scan is not running")
-    ev: asyncio.Event = state.get("pause_event")
-    if ev is None or not ev.is_set():
-        raise HTTPException(400, "scan is not running")
-    ev.clear()
+    _job_set_status(scan_id, "paused")
     db_set_scan_status(scan_id, "paused")
-    state["status"] = "paused"
     _audit(user["id"], "scan_pause", "scan", scan_id, "")
     return {"paused": True}
 
@@ -1154,17 +1274,40 @@ async def resume_scan(scan_id: str, request: Request):
     user = await current_user(request)
     _require_scan_write(user)
     _require_scan(scan_id, user["id"])
-    state = SCANS.get(scan_id)
-    if not state or state.get("status") != "paused":
+    job = _job_get(scan_id)
+    if not job or job["status"] != "paused":
         raise HTTPException(400, "scan is not paused")
-    ev: asyncio.Event = state.get("pause_event")
-    if ev is None:
-        raise HTTPException(400, "scan is not paused")
-    ev.set()
+    _job_set_status(scan_id, "chunk_done")
     db_set_scan_status(scan_id, "running")
-    state["status"] = "running"
     _audit(user["id"], "scan_resume", "scan", scan_id, "")
     return {"resumed": True}
+
+
+@app.post("/api/scans/{scan_id}/continue")
+async def continue_scan(scan_id: str, request: Request):
+    """Run the next chunk of a chunked scan (frontend polling calls this
+    when status is chunk_done)."""
+    user = await current_user(request)
+    _require_scan_write(user)
+    _require_scan(scan_id, user["id"])
+    result = await run_scan_chunk(scan_id)
+    return {"scan_id": scan_id, **result}
+
+
+@app.get("/api/scans/{scan_id}/events")
+async def scan_events(scan_id: str, request: Request, since: int = 0):
+    """Poll progress/finding events for the live terminal (replaces WebSocket)."""
+    user = await current_user(request)
+    _require_scan(scan_id, user["id"])
+    with _db_lock:
+        rows = db().execute(
+            "SELECT seq, type, data_json, created_at FROM scan_events "
+            "WHERE scan_id=? AND seq>? ORDER BY seq LIMIT 500",
+            (scan_id, since)).fetchall()
+    return {"events": [
+        {"seq": r["seq"], "type": r["type"],
+         "data": json.loads(r["data_json"] or "{}"),
+         "created_at": r["created_at"]} for r in rows]}
 
 
 @app.post("/api/scans/{scan_id}/rerun", status_code=201)
@@ -1174,7 +1317,8 @@ async def rerun_scan(scan_id: str, request: Request):
     row = _require_scan(scan_id, user["id"])
     cfg = json.loads(row["config_json"])
     new_id = _launch_scan(user["id"], row["target"], cfg)
-    return {"scan_id": new_id, "status": "queued"}
+    result = await run_scan_chunk(new_id)
+    return {"scan_id": new_id, "status": result["status"]}
 
 
 @app.get("/api/scans/{scan_id}/diff/{other_id}")
@@ -2403,43 +2547,6 @@ async def engine_stats(request: Request, scan_id: Optional[str] = None):
             "SELECT module, requests FROM engine_stats WHERE scan_id=?"
             " ORDER BY requests DESC", (scan_id,)).fetchall()
     return {"scan_id": scan_id, "modules": [dict(r) for r in rows]}
-
-
-# ---------------------------------------------------------------- websocket
-
-@app.websocket("/ws/scans/{scan_id}")
-async def ws_scan(ws: WebSocket, scan_id: str):
-    try:
-        uid = ws_token(ws)
-    except HTTPException:
-        await ws.close(code=4401)
-        return
-    row = db_get_scan(scan_id)
-    if not row or row["user_id"] != uid:
-        await ws.close(code=4404)
-        return
-    await ws.accept()
-    state = SCANS.get(scan_id)
-    findings = db_list_findings(scan_id)
-    await ws.send_json({"type": "state", "data": {
-        "scan_id": scan_id, "target": row["target"], "status": row["status"],
-        "counts": _severity_counts(findings), "total_findings": len(findings),
-    }})
-    if state:
-        for ev in state["events"]:
-            await ws.send_json(ev)
-        if state["status"] not in ("completed", "failed", "cancelled"):
-            queue: asyncio.Queue = state["queue"]
-            try:
-                while True:
-                    ev = await queue.get()
-                    await ws.send_json(ev)
-                    if ev.get("type") == "done":
-                        break
-            except WebSocketDisconnect:
-                return
-    await ws.send_json({"type": "done", "data": {"status": row["status"]}})
-    await ws.close()
 
 
 # ---------------------------------------------------------------- frontend static (mounted last)
