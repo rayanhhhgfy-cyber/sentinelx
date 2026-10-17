@@ -36,6 +36,12 @@ class ScanConfig:
     auth_a: str = ""
     auth_b: str = ""
     modules: list = field(default_factory=list)
+    # web-UI extensions (all optional, safe defaults)
+    custom_headers: dict = field(default_factory=dict)
+    custom_cookies: dict = field(default_factory=dict)
+    exclude_paths: list = field(default_factory=list)
+    pause_event: Optional["asyncio.Event"] = None
+    stats: Optional[dict] = None  # filled by engine: {"modules": {name: requests}}
 
 
 class TokenBucket:
@@ -73,11 +79,15 @@ class ScanClient:
         self.requests_made = 0
 
     async def __aenter__(self):
+        headers = {"User-Agent": self.config.user_agent}
+        for k, v in (self.config.custom_headers or {}).items():
+            headers[str(k)] = str(v)
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self.config.timeout, connect=10.0),
             follow_redirects=False,
             max_redirects=self.config.max_redirects,
-            headers={"User-Agent": self.config.user_agent},
+            headers=headers,
+            cookies=self.config.custom_cookies or None,
             verify=True,
             trust_env=False,
         )
@@ -105,6 +115,18 @@ class ScanClient:
         cookies: dict | None = None,
     ) -> httpx.Response | None:
         """Send one request with rate limiting + retry. Returns None on hard failure."""
+        # pause support: park here (non-blocking for the loop) while paused
+        if self.config.pause_event is not None:
+            await self.config.pause_event.wait()
+        # scope exclusions: skip matching paths without sending anything
+        if self.config.exclude_paths:
+            try:
+                _p = urlsplit(url).path or "/"
+                for _ex in self.config.exclude_paths:
+                    if _ex and _p.startswith(_ex):
+                        return None
+            except Exception:
+                pass
         await self._bucket(url).acquire()
         last_exc = None
         for attempt in range(self.config.max_retries + 1):
