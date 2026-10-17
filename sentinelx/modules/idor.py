@@ -18,6 +18,42 @@ from sentinelx.core.diff import fuzzy_similarity
 # param names that typically reference a direct object
 ID_PARAM_RE = re.compile(r"id|user|account|order|object|profile|customer|invoice|doc", re.I)
 
+# Public catalog params: enumerating these is NORMAL browsing, not IDOR.
+# /product?productId=2 showing product 2 is just a catalog — flagging it
+# as HIGH IDOR is a false positive. These are only tested when the endpoint
+# requires auth or returns user-private data.
+PUBLIC_CATALOG_PARAM_RE = re.compile(
+    r"^(product|item|article|post|page|category|blog|news|image|img|"
+    r"video|file|doc|document|listing)s?[-_]?ids?$", re.I)
+
+# Markers of user-private data: if the response contains these, the endpoint
+# returns user-specific data and ID enumeration is a real test.
+PRIVATE_DATA_RE = re.compile(
+    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"  # email address
+    r"|my account|my profile|my orders|order history|log\s?out|sign\s?out"
+    r"|username|phone|date of birth|\bssn\b|credit card|my address",
+    re.I)
+
+# Path segments that indicate a public catalog (for path-based enumeration)
+PUBLIC_CATALOG_PATH_RE = re.compile(
+    r"/(products?|items?|articles?|posts?|pages?|categories|blog|news|"
+    r"images?|videos?|files?|docs?|listings?)/\d+", re.I)
+
+
+def _extract_emails(body: str) -> set[str]:
+    return set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", body))
+
+
+def _is_public_catalog(param: str, baseline_body: str, config) -> bool:
+    """True if this looks like public catalog browsing, not an IDOR vector."""
+    if not PUBLIC_CATALOG_PARAM_RE.match(param or ""):
+        return False
+    if config.auth_a or config.auth_b:
+        return False  # auth in play -> authorization matters -> test it
+    if PRIVATE_DATA_RE.search(baseline_body):
+        return False  # user-private data in response -> test it
+    return True
+
 REMEDIATION_IDOR = (
     "Enforce server-side authorization on every object access: verify the "
     "authenticated user owns (or may access) the requested object id. Never "
@@ -170,6 +206,14 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
             continue  # unstable or inaccessible baseline; skip
         base_body = base_bodies[0]
 
+        # FALSE-POSITIVE GUARD: public catalog browsing (e.g. /product?productId=2
+        # on an unauthenticated shop) is not IDOR. Skip unless the endpoint needs
+        # auth or returns user-private data.
+        if _is_public_catalog(param, base_body, config):
+            continue
+        base_emails = _extract_emails(base_body)
+        base_has_private = bool(PRIVATE_DATA_RE.search(base_body))
+
         for variant in variants:
             resp, full, body_sent, req_h = await _send(
                 client, method, url, params, param, variant)
@@ -179,13 +223,32 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
             reflected = variant in resp.text
             # >30% different content AND mutated id reflected => other object
             if sim < 0.7 and reflected:
+                # REAL-IDOR CONFIRMATION: is this another USER's private data,
+                # or just different public content? Compare user identifiers.
+                var_emails = _extract_emails(resp.text)
+                var_has_private = bool(PRIVATE_DATA_RE.search(resp.text))
+                cross_user = bool(base_emails and var_emails and
+                                  base_emails.isdisjoint(var_emails))
+                # Skip: public content with no private data on either side and
+                # no auth in play -> just different catalog items, not IDOR.
+                if (not base_has_private and not var_has_private
+                        and not cross_user
+                        and not (config.auth_a or config.auth_b)):
+                    continue
+                confidence = 0.90 if (cross_user or base_has_private) else 0.75
+                proof_extra = ""
+                if cross_user:
+                    proof_extra = (f" Cross-user confirmed: baseline exposed "
+                                   f"{sorted(base_emails)[:2]}, variant exposed "
+                                   f"{sorted(var_emails)[:2]}.")
                 ev = _evidence(method, full, {**headers, **req_h}, body_sent, resp)
                 ev.proof = (f"Object id {variant} returned HTTP 200 with {1 - sim:.0%} "
-                            f"content difference vs id {params[param]}; mutated id reflected")
+                            f"content difference vs id {params[param]}; mutated id reflected."
+                            f"{proof_extra}")
                 findings.append(Finding(
                     type="Insecure Direct Object Reference", subtype=variant_kind,
                     cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N",
-                    confidence=0.85, url=full, method=method, param=param,
+                    confidence=confidence, url=full, method=method, param=param,
                     payload=variant, evidence=ev, cwe="CWE-639",
                     owasp="A01:2021 – Broken Access Control",
                     remediation=REMEDIATION_IDOR,
@@ -213,29 +276,46 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 base_bodies.append(resp.text)
             if len(base_bodies) == 2 and base_bodies[0] == base_bodies[1]:
                 base_body = base_bodies[0]
-                for delta in (1, -1):
-                    variant = str(n + delta)
-                    new_path = u.path[:m.start(1)] + variant + m.group(2)
-                    new_url = urlunsplit((u.scheme, u.netloc, new_path, u.query, u.fragment))
-                    resp, full, body_sent, req_h = await _send_path(client, new_url)
-                    if not resp or resp.status_code != 200:
-                        continue
-                    sim = fuzzy_similarity(base_body, resp.text)
-                    if sim < 0.7 and variant in resp.text:
-                        ev = _evidence("GET", full, headers, body_sent, resp)
-                        ev.proof = (f"Path id {variant} returned HTTP 200 with "
-                                    f"{1 - sim:.0%} content difference vs id {orig_id}")
-                        findings.append(Finding(
-                            type="Insecure Direct Object Reference",
-                            subtype="path-id-enumeration",
-                            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N",
-                            confidence=0.85, url=full, method="GET", param="path-id",
-                            payload=variant, evidence=ev, cwe="CWE-639",
-                            owasp="A01:2021 – Broken Access Control",
-                            remediation=REMEDIATION_IDOR,
-                            references=["https://owasp.org/www-community/attacks/Insecure_Direct_Object_Reference"],
-                        ))
-                        break
+                # FALSE-POSITIVE GUARD: /products/2 is catalog browsing, not IDOR.
+                if (PUBLIC_CATALOG_PATH_RE.search(u.path)
+                        and not (config.auth_a or config.auth_b)
+                        and not PRIVATE_DATA_RE.search(base_body)):
+                    pass  # public catalog path; skip enumeration
+                else:
+                    base_emails = _extract_emails(base_body)
+                    base_has_private = bool(PRIVATE_DATA_RE.search(base_body))
+                    for delta in (1, -1):
+                        variant = str(n + delta)
+                        new_path = u.path[:m.start(1)] + variant + m.group(2)
+                        new_url = urlunsplit((u.scheme, u.netloc, new_path, u.query, u.fragment))
+                        resp, full, body_sent, req_h = await _send_path(client, new_url)
+                        if not resp or resp.status_code != 200:
+                            continue
+                        sim = fuzzy_similarity(base_body, resp.text)
+                        if sim < 0.7 and variant in resp.text:
+                            var_emails = _extract_emails(resp.text)
+                            var_has_private = bool(PRIVATE_DATA_RE.search(resp.text))
+                            cross_user = bool(base_emails and var_emails and
+                                              base_emails.isdisjoint(var_emails))
+                            if (not base_has_private and not var_has_private
+                                    and not cross_user
+                                    and not (config.auth_a or config.auth_b)):
+                                continue
+                            confidence = 0.90 if (cross_user or base_has_private) else 0.75
+                            ev = _evidence("GET", full, headers, body_sent, resp)
+                            ev.proof = (f"Path id {variant} returned HTTP 200 with "
+                                        f"{1 - sim:.0%} content difference vs id {orig_id}")
+                            findings.append(Finding(
+                                type="Insecure Direct Object Reference",
+                                subtype="path-id-enumeration",
+                                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N",
+                                confidence=confidence, url=full, method="GET", param="path-id",
+                                payload=variant, evidence=ev, cwe="CWE-639",
+                                owasp="A01:2021 – Broken Access Control",
+                                remediation=REMEDIATION_IDOR,
+                                references=["https://owasp.org/www-community/attacks/Insecure_Direct_Object_Reference"],
+                            ))
+                            break
 
     # ---------- 3. cross-session replay (auth_a vs auth_b) ----------
     if config.auth_a and config.auth_b:

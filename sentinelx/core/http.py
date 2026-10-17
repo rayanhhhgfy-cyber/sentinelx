@@ -186,9 +186,24 @@ class ScanClient:
         await bucket.acquire()
 
         # request dedup: only for safe idempotent GETs with no body
+        # NOTE: headers and cookies are part of the key — an Authorization
+        # header or session cookie changes the response; without them the
+        # cache returns the wrong (anonymous) response for authed probes.
         dedup_key = None
         if dedupe and method == "GET" and data is None and json_data is None:
-            dedup_key = f"GET|{url}|{urlencode(sorted((params or {}).items())) if params else ''}"
+            hdr_part = ""
+            if headers:
+                # exclude volatile headers; include auth-relevant ones
+                rel = {k.lower(): v for k, v in headers.items()
+                       if k.lower() in ("authorization", "cookie", "x-forwarded-host",
+                                        "x-forwarded-for", "origin", "host")}
+                if rel:
+                    hdr_part = "|" + urlencode(sorted(rel.items()))
+            ck_part = ""
+            if cookies:
+                ck_part = "|" + urlencode(sorted(cookies.items()))
+            dedup_key = (f"GET|{url}|{urlencode(sorted((params or {}).items())) if params else ''}"
+                         f"{hdr_part}{ck_part}")
             async with self._dedup_lock:
                 hit = self._dedup_cache.get(dedup_key)
                 if hit and (time.monotonic() - hit[1]) < self._dedup_ttl:
