@@ -69,6 +69,36 @@ def _numeric_variants(original: str) -> list[str]:
     return sorted(variants, key=lambda v: abs(int(v) - n))
 
 
+def _uuid_variants(original: str) -> list[str]:
+    """UUID-adjacent enumeration: flip last hex digit, try nil UUID."""
+    import re as _re
+    if not _re.match(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", original):
+        return []
+    last = original[-1]
+    flipped = "0" if last.lower() != "0" else "1"
+    variants = [original[:-1] + flipped,
+                "00000000-0000-0000-0000-000000000000"]
+    return [v for v in variants if v != original]
+
+
+def _timestamp_variants(original: str) -> list[str]:
+    """Timestamp-based IDs: ±1s, ±1h, ±1d for epoch-ish values."""
+    try:
+        n = int(original)
+    except (ValueError, TypeError):
+        return []
+    # heuristic: 10-digit (seconds) or 13-digit (ms) epoch
+    if not (9 <= len(original) <= 13):
+        return []
+    if len(original) == 13:
+        deltas = [1000, -1000, 3600000, -3600000]
+    else:
+        deltas = [1, -1, 3600, -3600, 86400, -86400]
+    return [str(n + d) for d in deltas]
+
+
 async def scan_endpoint(client: ScanClient, config: ScanConfig,
                         method: str, url: str, params: dict) -> list[Finding]:
     findings: list[Finding] = []
@@ -78,6 +108,14 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     id_params = [p for p in (params or {}) if ID_PARAM_RE.search(p)]
     for param in id_params:
         variants = _numeric_variants(params[param])
+        variant_kind = "numeric-enumeration"
+        if not variants:
+            # try UUID-adjacent, then timestamp-based IDs
+            variants = _uuid_variants(params[param])
+            variant_kind = "uuid-enumeration"
+        if not variants:
+            variants = _timestamp_variants(params[param])
+            variant_kind = "timestamp-enumeration"
         if not variants:
             continue
         # baseline: 2 samples, must be stable and 200
@@ -106,7 +144,7 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 ev.proof = (f"Object id {variant} returned HTTP 200 with {1 - sim:.0%} "
                             f"content difference vs id {params[param]}; mutated id reflected")
                 findings.append(Finding(
-                    type="Insecure Direct Object Reference", subtype="numeric-enumeration",
+                    type="Insecure Direct Object Reference", subtype=variant_kind,
                     cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N",
                     confidence=0.85, url=full, method=method, param=param,
                     payload=variant, evidence=ev, cwe="CWE-639",
