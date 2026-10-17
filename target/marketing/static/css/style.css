@@ -1,0 +1,10 @@
+/* Nexora marketing site styles */
+body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 1rem; color: #1a1a2e; }
+header { border-bottom: 3px solid #6c5ce7; margin-bottom: 1.5rem; }
+nav a { margin-right: .4rem; color: #6c5ce7; }
+nav a.active { font-weight: bold; }
+footer { margin-top: 3rem; border-top: 1px solid #ccc; font-size: .85rem; color: #666; }
+.error { color: #c0392b; background: #fdecea; padding: .5rem; }
+#nx-promo { background: #fff3cd; padding: .5rem; margin: .5rem 0; }
+input, textarea { margin: .25rem 0; padding: .4rem; width: 300px; max-width: 100%; }
+button { background: #6c5ce7; color: #fff; border: 0; padding: .5rem 1rem; cursor: pointer; }
