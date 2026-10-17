@@ -1,17 +1,19 @@
-"""SentinelX module [35]: DOM-based XSS via pure-Python JS execution.
+"""SentinelX module [35]: DOM-based XSS via real JavaScript execution.
 
-Real implementation — no Playwright, no headless browser. Page <script>
-blocks are EXECUTED inside SentinelX's own JS interpreter (sentinelx/jsenv)
-against a virtual browser. location.hash / location.search are seeded with
-canary values; the interpreter tracks taint from those sources through
-string operations. When tainted data reaches a sink — innerHTML, outerHTML,
-document.write, eval, Function, setTimeout(string), event-handler
-attributes — that is a REAL dataflow observed during REAL execution, and a
-finding is emitted with the sink, the tainted value, and the code path.
+Powered by sentinelx.jsruntime (js2py — real ECMAScript 5.1 engine).
+Page <script> blocks are EXECUTED inside the virtual browser.
+location.hash / location.search are seeded with unique taint canaries;
+the instrumented environment records every sink hit. When a canary
+reaches a sink — innerHTML, outerHTML, document.write, eval, Function,
+setTimeout(string) — that is a PROVEN source → sink dataflow observed
+during real JS execution.
 
-Two-signal rule: a sink hit counts only if (1) the canary value is present
-in the sink payload AND (2) the taint label traces to location.hash or
-location.search. Static pattern matches alone never produce findings.
+Confidence:
+- CONFIRMED: canary from hash/search proven to reach a dangerous sink
+- MEDIUM: sink executed at runtime but no canary flow proven
+- LOW (static_only): dangerous sink pattern in JS, never observed at runtime
+
+Static patterns alone NEVER produce findings above LOW.
 """
 
 from __future__ import annotations
@@ -21,22 +23,17 @@ from html.parser import HTMLParser
 
 from sentinelx.core.http import ScanClient, ScanConfig
 from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
-from sentinelx.jsenv.executor import execute_scripts
+from sentinelx.jsruntime import execute, instrument, taint as taint_mod
 from sentinelx.jsenv.static import score_js_interest
 
 
-CANARY = "SXDOMXSS9ZQ"
-HASH_CANARY = "#" + CANARY
-SEARCH_CANARY = "?sx=" + CANARY
-
 # sinks that execute attacker-controlled data as code/markup
 DANGEROUS_SINKS = {
-    "innerHTML", "outerHTML", "document.write", "document.writeln",
-    "eval", "Function", "setTimeout(string)", "setInterval(string)",
+    "sink:innerHTML", "sink:outerHTML", "sink:document.write",
+    "sink:eval", "sink:Function",
+    "sink:setTimeout-string", "sink:setInterval-string",
+    "sink:js-url-attr",
 }
-
-# sinks that are markup but need a script-execution context to be XSS
-TAINTED_TEXT_OK = "(text-safe)"  # textContent/innerText — recorded but not XSS
 
 
 class _ScriptExtractor(HTMLParser):
@@ -49,7 +46,6 @@ class _ScriptExtractor(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag == "script":
             a = dict(attrs)
-            # external src or non-JS types: skip body
             if a.get("src"):
                 self._skip = True
                 return
@@ -91,6 +87,10 @@ REMEDIATION_DOMXSS = (
 )
 
 
+def _sink_subtype(kind: str) -> str:
+    return "dom-xss-" + kind.split(":", 1)[1].replace(".", "-")
+
+
 async def scan_endpoint(client: ScanClient, config: ScanConfig,
                         method: str, url: str, params: dict) -> list[Finding]:
     findings: list[Finding] = []
@@ -113,62 +113,67 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     if not scripts:
         return findings
 
-    # prioritize: only execute scripts that mention sinks (cheap static gate)
+    # cheap static gate: only execute scripts that mention sinks/sources
     interesting = []
     for js in scripts:
         if len(js) > 60000:
-            continue  # pathological bundle — static path covers discovery
+            continue
         score, sinks, sources = score_js_interest(js)
         if score > 0:
-            interesting.append((score, js, sinks, sources))
+            interesting.append((score, js, sinks))
     if not interesting:
         return findings
     interesting.sort(key=lambda x: -x[0])
-    interesting = interesting[:6]  # bound execution cost per page
+    interesting = interesting[:6]
 
-    seen_sinks: set[str] = set()
-    for score, js, sinks, sources in interesting:
-        result = execute_scripts(
-            [js], page_url=url,
-            hash_canary=HASH_CANARY, search_canary=SEARCH_CANARY,
+    # one taint tracker per page; hash canary is the primary source
+    tracker = taint_mod.TaintTracker()
+    hash_mark = tracker.new_mark(taint_mod.Source.FRAGMENT, "location.hash")
+    search_mark = tracker.new_mark(taint_mod.Source.QUERY, "location.search")
+
+    seen: set[tuple] = set()
+    for score, js, static_sinks in interesting:
+        result = execute(
+            js, page_url=url,
+            hash_canary=hash_mark.canary, search_canary=search_mark.canary,
+            timeout=10,
         )
         if not result.executed:
             continue
 
-        # --- signal 1+2: canary present AND tainted from hash/search ---
-        for w in result.dom_writes:
-            sink_base = w["sink"].split("#")[0]
-            if sink_base not in DANGEROUS_SINKS:
-                continue
-            if TAINTED_TEXT_OK in w["sink"]:
-                continue
-            if CANARY not in w["value"]:
-                continue  # signal 1: canary must reach the sink
-            taint = w["taint"] or ""
-            if "location.hash" not in taint and "location.search" not in taint:
-                continue  # signal 2: must be attacker-controlled flow
-            key = (sink_base, taint)
-            if key in seen_sinks:
-                continue
-            seen_sinks.add(key)
+        # correlate: static sinks + runtime taint flows → confidence
+        cf = instrument.correlate_dom_xss(static_sinks, result, tracker)
 
-            src = "location.hash" if "location.hash" in taint else "location.search"
-            proof = (
-                f"DOM XSS confirmed by JS execution: tainted data from {src} "
-                f"reached sink {w['sink']} during real interpretation. "
-                f"Sink received: {w['value'][:220]}"
-            )
+        for flow in cf.flows:
+            if flow.sink not in DANGEROUS_SINKS:
+                continue
+            key = (flow.sink, flow.source_id)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            is_code_sink = flow.sink in (
+                "sink:eval", "sink:Function",
+                "sink:setTimeout-string", "sink:setInterval-string")
             ev = Evidence(
                 request_raw=raw_request("GET", url, headers, None),
                 response_raw=raw_response(resp.status_code, dict(resp.headers),
                                           resp.content[:1500]),
-                proof=proof,
+                proof=(
+                    f"DOM XSS CONFIRMED by real JS execution (js2py): tainted "
+                    f"data from {flow.source}({flow.source_id}) reached "
+                    f"{flow.sink}. Sink received: {flow.evidence[:220]}"
+                ),
             )
-            findings.append(Finding(
-                type="Cross-Site Scripting", subtype=f"dom-xss-{sink_base}",
-                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
-                confidence=0.85, url=url, method="GET", param=src,
-                payload=HASH_CANARY if "hash" in src else SEARCH_CANARY,
+            f = Finding(
+                type="Cross-Site Scripting",
+                subtype=_sink_subtype(flow.sink),
+                cvss_vector=("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:N"
+                             if is_code_sink else
+                             "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"),
+                confidence=0.95, url=url, method="GET", param=flow.source_id,
+                payload="#" + hash_mark.canary if flow.source_id == "location.hash"
+                else "?" + search_mark.canary,
                 evidence=ev, cwe="CWE-79",
                 owasp="A03:2021 – Injection",
                 remediation=REMEDIATION_DOMXSS,
@@ -176,37 +181,49 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                     "https://owasp.org/www-community/attacks/DOM_Based_XSS",
                     "https://portswigger.net/web-security/cross-site-scripting/dom-based",
                 ],
-            ))
-
-        # eval-family sinks with tainted input
-        for e in result.eval_calls:
-            if CANARY not in e["code"]:
-                continue
-            taint = e["taint"] or ""
-            if "location.hash" not in taint and "location.search" not in taint:
-                continue
-            key = ("eval:" + e["sink"], taint)
-            if key in seen_sinks:
-                continue
-            seen_sinks.add(key)
-            src = "location.hash" if "location.hash" in taint else "location.search"
-            ev = Evidence(
-                request_raw=raw_request("GET", url, headers, None),
-                response_raw=raw_response(resp.status_code, dict(resp.headers),
-                                          resp.content[:1500]),
-                proof=(f"DOM code injection confirmed by JS execution: tainted "
-                       f"data from {src} reached {e['sink']}. "
-                       f"Code: {e['code'][:220]}"),
             )
-            findings.append(Finding(
-                type="Cross-Site Scripting", subtype=f"dom-code-injection-{e['sink']}",
-                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:N",
-                confidence=0.88, url=url, method="GET", param=src,
-                payload=HASH_CANARY if "hash" in src else SEARCH_CANARY,
-                evidence=ev, cwe="CWE-79",
-                owasp="A03:2021 – Injection",
-                remediation=REMEDIATION_DOMXSS,
-                references=["https://owasp.org/www-community/attacks/DOM_Based_XSS"],
-            ))
+            f.set_confidence("CONFIRMED")
+            f.source = f"{flow.source}({flow.source_id})"
+            f.sink = flow.sink
+            f.execution_trace = [
+                {"kind": e.get("kind"), "data": e.get("data")}
+                for e in result.trace[:25]
+            ]
+            findings.append(f)
+
+        # MEDIUM: dangerous sink executed at runtime, no canary flow proven.
+        # Only report once per sink kind per page to avoid noise.
+        if cf.confidence == "MEDIUM":
+            for e in result.dom_writes + result.eval_calls:
+                kind = str(e.get("kind", ""))
+                if kind not in DANGEROUS_SINKS:
+                    continue
+                key = ("medium", kind)
+                if key in seen:
+                    continue
+                seen.add(key)
+                d = e.get("data") or {}
+                ev = Evidence(
+                    request_raw=raw_request("GET", url, headers, None),
+                    response_raw=raw_response(resp.status_code, dict(resp.headers),
+                                              resp.content[:1500]),
+                    proof=(f"DOM sink {kind} executed during real JS "
+                           f"execution, but no attacker-controlled data flow "
+                           f"was proven. Sink received: "
+                           f"{str(d.get('value', ''))[:220]}"),
+                )
+                f = Finding(
+                    type="Cross-Site Scripting",
+                    subtype=_sink_subtype(kind) + "-unproven",
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:N/I:L/A:N",
+                    confidence=0.55, url=url, method="GET", param="",
+                    evidence=ev, cwe="CWE-79",
+                    owasp="A03:2021 – Injection",
+                    remediation=REMEDIATION_DOMXSS,
+                    references=["https://owasp.org/www-community/attacks/DOM_Based_XSS"],
+                )
+                f.set_confidence("MEDIUM")
+                f.sink = kind
+                findings.append(f)
 
     return findings
