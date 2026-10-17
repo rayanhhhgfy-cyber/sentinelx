@@ -186,10 +186,209 @@ def _evidence(method, url, req_headers, body_sent, resp) -> Evidence:
     )
 
 
+async def _test_cookies(client: ScanClient, config: ScanConfig,
+                        method: str, url: str, params: dict) -> list[Finding]:
+    """Cookie-based SQLi (PortSwigger TrackingId pattern).
+
+    Many labs inject via cookies, not URL params. Tests each non-session
+    cookie with error-based, boolean-blind, and time-blind techniques.
+    NOTE: dedupe=False everywhere — the request dedup cache key does not
+    include cookies, so cached responses would mask cookie variants.
+    """
+    findings: list[Finding] = []
+    headers = {"User-Agent": config.user_agent}
+    # Collect cookie names from Set-Cookie headers (manual parse — more
+    # reliable than the httpx jar, which can silently drop cookies).
+    cookie_names: list[str] = []
+    try:
+        probe = await client.get(url, dedupe=False)
+        if probe:
+            # get_list for multiple Set-Cookie headers
+            raw_cookies = probe.headers.get_list("set-cookie") if hasattr(
+                probe.headers, "get_list") else [probe.headers.get("set-cookie", "")]
+            for sc in raw_cookies:
+                if not sc:
+                    continue
+                m = re.match(r"\s*([^=;\s]+)=", sc)
+                if m and m.group(1) not in cookie_names:
+                    cookie_names.append(m.group(1))
+        # also merge anything the jar did capture
+        jar = client._client.cookies if client._client else None
+        if jar:
+            for k in jar.keys():
+                if k not in cookie_names:
+                    cookie_names.append(k)
+    except Exception:
+        return findings
+    if not cookie_names:
+        return findings
+    # map cookie name -> original value (from Set-Cookie or jar)
+    orig_values: dict[str, str] = {}
+    try:
+        if probe:
+            raw_cookies = probe.headers.get_list("set-cookie") if hasattr(
+                probe.headers, "get_list") else [probe.headers.get("set-cookie", "")]
+            for sc in raw_cookies:
+                m = re.match(r"\s*([^=;\s]+)=([^;]*)", sc or "")
+                if m:
+                    orig_values[m.group(1)] = m.group(2)
+        jar = client._client.cookies if client._client else None
+        if jar:
+            for k in jar.keys():
+                try:
+                    if k not in orig_values:
+                        orig_values[k] = jar[k]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    COOKIE_SKIP = re.compile(r"session|auth|token|csrf|_ga|_gid", re.I)
+    for cname in cookie_names:
+        if COOKIE_SKIP.search(cname):
+            continue
+        corig = orig_values.get(cname, "test123")
+        if not corig or len(corig) > 500:
+            continue
+
+        async def _csend(cval: str):
+            # Set directly in the jar (not per-request cookies=): httpx merges
+            # per-request cookies WITH the jar, producing duplicate Cookie
+            # headers where the server reads the clean value first.
+            # Clear first: .set() on an existing domain cookie duplicates.
+            t0 = time.monotonic()
+            try:
+                jar = client._client.cookies
+                # remove all existing entries for this name, then set
+                for _ in range(3):
+                    try:
+                        jar.delete(cname)
+                    except Exception:
+                        break
+                jar.set(cname, cval)
+            except Exception:
+                pass
+            try:
+                if method == "GET":
+                    qs = _urlencode(params) if params else ""
+                    full = url + ("?" + qs if qs else "")
+                    resp = await client.get(full, dedupe=False)
+                else:
+                    resp = await client.post(url, data=params or {},
+                                             dedupe=False)
+                    full = url
+            finally:
+                try:
+                    jar = client._client.cookies
+                    for _ in range(3):
+                        try:
+                            jar.delete(cname)
+                        except Exception:
+                            break
+                    jar.set(cname, corig)
+                except Exception:
+                    pass
+            return resp, time.monotonic() - t0, full
+
+        # cookie baseline: 2 samples, must be stable and 200
+        cb1, _, _ = await _csend(corig)
+        cb2, _, _ = await _csend(corig)
+        if not cb1 or not cb2 or cb1.text != cb2.text or cb1.status_code != 200:
+            continue
+        cbase, cbase_status = cb1.text, cb1.status_code
+
+        # 6a. error-based via cookie
+        cookie_hit = False
+        for payload in ERROR_PAYLOADS[:8]:
+            resp, _, cfull = await _csend(corig + payload)
+            if not resp:
+                continue
+            db = detect_db_error(resp.text)
+            if db and not detect_db_error(cbase):
+                ev = _evidence(method, cfull, headers, None, resp)
+                ev.proof = (f"Database error signature for {db} appeared only "
+                            f"with cookie payload (cookie: {cname})")
+                findings.append(Finding(
+                    type="SQL Injection", subtype="error-based-cookie",
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                    confidence=0.95, url=cfull, method=method, param=f"cookie:{cname}",
+                    payload=payload, evidence=ev, cwe="CWE-89",
+                    owasp="A03:2021 – Injection",
+                    remediation=REMEDIATION_SQLI,
+                    references=["https://owasp.org/www-community/attacks/SQL_Injection"],
+                ))
+                cookie_hit = True
+                break
+        if cookie_hit:
+            continue
+
+        # 6b. boolean-blind via cookie (3 samples each)
+        tb, fb = [], []
+        for _ in range(3):
+            rt, _, _ = await _csend(corig + BOOLEAN_TRUE[0])
+            rf, _, _ = await _csend(corig + BOOLEAN_FALSE[0])
+            if rt:
+                tb.append(rt.text)
+            if rf:
+                fb.append(rf.text)
+        if (len(tb) == 3 and len(fb) == 3 and len(set(tb)) == 1
+                and len(set(fb)) == 1 and tb[0] != fb[0]):
+            t_sig, _ = is_significant_change(cbase, tb[0], cbase_status, cbase_status)
+            f_sig, _ = is_significant_change(cbase, fb[0], cbase_status, cbase_status)
+            if not t_sig and f_sig:
+                resp, _, cfull = await _csend(corig + BOOLEAN_TRUE[0])
+                ev = _evidence(method, cfull, headers, None, resp)
+                ev.proof = ("Cookie boolean-blind: TRUE payload matched baseline "
+                            "(3/3), FALSE payload changed content (3/3)")
+                findings.append(Finding(
+                    type="SQL Injection", subtype="boolean-blind-cookie",
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                    confidence=0.90, url=cfull, method=method, param=f"cookie:{cname}",
+                    payload=BOOLEAN_TRUE[0], evidence=ev, cwe="CWE-89",
+                    owasp="A03:2021 – Injection",
+                    remediation=REMEDIATION_SQLI,
+                    references=["https://owasp.org/www-community/attacks/Blind_SQL_Injection"],
+                ))
+                continue
+
+        # 6c. time-blind via cookie (adaptive delay, tight bounds)
+        tbl = await get_baseline(client, method, url, params)
+        cdelay = adaptive_delay(tbl.avg_time if tbl else 0.3)
+        d_int = int(cdelay)
+        for dbname, tmpl in _order_by_tech(TIME_PAYLOADS, config)[:3]:
+            payload = tmpl.format(d=d_int)
+            r1, e1, cfull = await _csend(corig + payload)
+            if not r1:
+                continue
+            _, e_ctrl, _ = await _csend(corig)
+            r2, e2, _ = await _csend(corig + payload)
+            if not r2:
+                continue
+            lo, hi = d_int * 0.8, d_int * 1.5
+            if lo <= e1 <= hi and lo <= e2 <= hi and e_ctrl < d_int * 0.5:
+                ev = _evidence(method, cfull, headers, None, r1)
+                ev.proof = (f"Cookie time-blind: {e1:.1f}s and {e2:.1f}s delays "
+                            f"with {dbname} payload (cookie: {cname})")
+                findings.append(Finding(
+                    type="SQL Injection", subtype="time-blind-cookie",
+                    severity="critical",
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                    confidence=0.85, url=cfull, method=method, param=f"cookie:{cname}",
+                    payload=payload, evidence=ev, cwe="CWE-89",
+                    owasp="A03:2021 – Injection",
+                    remediation=REMEDIATION_SQLI,
+                    references=["https://owasp.org/www-community/attacks/Blind_SQL_Injection"],
+                ))
+                break
+    return findings
+
+
 async def scan_endpoint(client: ScanClient, config: ScanConfig,
                         method: str, url: str, params: dict) -> list[Finding]:
     findings: list[Finding] = []
+    # Cookie-based SQLi runs even without URL params (TrackingId pattern),
+    # so the cookie tests live in _test_cookies() called at the end.
     if not params:
+        findings.extend(await _test_cookies(client, config, method, url, {}))
         return findings
     headers = {"User-Agent": config.user_agent}
 
@@ -483,4 +682,6 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                     remediation=REMEDIATION_SQLI,
                     references=["https://owasp.org/www-community/attacks/SQL_Injection"],
                 ))
+    # ---- 6. cookie-based SQLi (TrackingId pattern) ----
+    findings.extend(await _test_cookies(client, config, method, url, params or {}))
     return findings
