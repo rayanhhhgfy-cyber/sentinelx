@@ -177,7 +177,13 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         resp, full, sent = await _bearer_probe(client, url, none_token, headers)
         if resp and resp.status_code == 200:
             sim = fuzzy_similarity(base_body, resp.text)
-            if sim > 0.75:
+            # Accepted if: similar to baseline (same user) OR clearly different
+            # from the rejected garbage token. A successful alg:none escalation
+            # to admin SHOULD look different from the baseline — that's the
+            # vulnerability working, not a false positive.
+            garbage_text = g_resp.text if g_resp else ""
+            garbage_sim = fuzzy_similarity(garbage_text, resp.text)
+            if sim > 0.75 or (g_resp and g_resp.status_code != 200 and garbage_sim < 0.75):
                 ev = _evidence("GET", full, sent, None, resp)
                 ev.proof = (f"alg:none token (empty signature) accepted: HTTP 200, "
                             f"{sim:.0%} content similarity to valid-token baseline "

@@ -114,12 +114,12 @@ REMEDIATION_XXE = (
 async def scan_endpoint(client: ScanClient, config: ScanConfig,
                         method: str, url: str, params: dict) -> list[Finding]:
     findings: list[Finding] = []
-    if not params:
-        return findings
     headers = {"User-Agent": config.user_agent,
                "Content-Type": "application/xml"}
 
     # signal 1: does the endpoint accept XML? (content-type switching)
+    # (No params gate: XXE is about the body, not form fields. The
+    # xml_accepted check below is the real gate.)
     probe_xml = '<?xml version="1.0"?><r><test>sx</test></r>'
     p = dict(params)
     # send as raw XML body regardless of original method params
