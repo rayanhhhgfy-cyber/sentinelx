@@ -45,7 +45,59 @@ REQUIRED_HEADERS = {
         "Set Referrer-Policy: strict-origin-when-cross-origin (or stricter).",
         "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
     ),
+    # --- deep-check additions: modern isolation headers ---
+    "permissions-policy": (
+        "Missing Permissions-Policy",
+        "Set Permissions-Policy to disable unused browser features "
+        "(e.g. camera=(), microphone=(), geolocation=()).",
+        "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    ),
+    "cross-origin-embedder-policy": (
+        "Missing Cross-Origin-Embedder-Policy",
+        "Set Cross-Origin-Embedder-Policy: require-corp to enable "
+        "cross-origin isolation (Spectre defense).",
+        "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    ),
+    "cross-origin-opener-policy": (
+        "Missing Cross-Origin-Opener-Policy",
+        "Set Cross-Origin-Opener-Policy: same-origin to isolate the "
+        "browsing context from cross-origin popups.",
+        "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    ),
+    "cross-origin-resource-policy": (
+        "Missing Cross-Origin-Resource-Policy",
+        "Set Cross-Origin-Resource-Policy: same-origin (or same-site) "
+        "to control which sites may load this resource.",
+        "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    ),
 }
+
+
+def _check_csp_weaknesses(csp: str) -> list[tuple[str, str]]:
+    """Return (issue, detail) for weak CSP directives. Only flags real gaps."""
+    issues = []
+    low = csp.lower()
+    if "'unsafe-inline'" in low:
+        issues.append(("csp-unsafe-inline",
+                       "CSP allows 'unsafe-inline' — XSS payloads can execute inline"))
+    if "'unsafe-eval'" in low:
+        issues.append(("csp-unsafe-eval",
+                       "CSP allows 'unsafe-eval' — enables JS code-generation attacks"))
+    if "data:" in low and "script-src" in low:
+        # data: in script-src is dangerous
+        for directive in low.split(";"):
+            if directive.strip().startswith("script-src") and "data:" in directive:
+                issues.append(("csp-data-in-script-src",
+                               "CSP script-src allows data: URIs — XSS bypass vector"))
+                break
+    if "*" in low:
+        for directive in low.split(";"):
+            d = directive.strip()
+            if d.startswith(("script-src", "object-src")) and "*" in d.split():
+                issues.append(("csp-wildcard",
+                               f"CSP {d.split()[0]} uses wildcard — overly permissive"))
+                break
+    return issues
 
 
 async def scan_headers(client: ScanClient, config: ScanConfig, url: str) -> list[Finding]:
@@ -86,6 +138,22 @@ async def scan_headers(client: ScanClient, config: ScanConfig, url: str) -> list
                 ))
         except (ValueError, IndexError):
             pass
+    # weak CSP directive analysis (only when CSP is present)
+    csp = present.get("content-security-policy", "")
+    if csp:
+        for subtype, detail in _check_csp_weaknesses(csp):
+            ev = _ev("GET", url, headers, resp)
+            ev.proof = f"CSP: {csp[:300]} — {detail}"
+            findings.append(Finding(
+                type="Security Misconfiguration", subtype=subtype,
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N",
+                confidence=0.9, url=url, method="GET", param="",
+                payload=detail, evidence=ev, cwe="CWE-693",
+                owasp="A05:2021 – Security Misconfiguration",
+                remediation="Tighten the CSP: remove 'unsafe-inline'/'unsafe-eval', "
+                            "avoid wildcards and data: in script-src.",
+                references=["https://owasp.org/www-project-secure-headers/"],
+            ))
     return findings
 
 

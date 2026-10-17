@@ -22,6 +22,7 @@ from sentinelx.modules import secrets as secrets_mod, techfp, graphql
 from sentinelx.modules import xxe, ssti, hostheader, cachepoison, deser
 from sentinelx.modules import ldap, xpath, header_rce, crlf, jsredirect
 from sentinelx.modules import takeover, clickjack, idor_api, jwt_adv, proto_pollute
+from sentinelx.modules import blogic
 
 
 STAGES = [
@@ -36,6 +37,14 @@ STAGES = [
     "target_extra",   # takeover + clickjack (target-level, once)
     "endpoints",      # per-endpoint active modules (cursor-based, chunkable)
     "finalize",       # AI brain chaining (no new findings)
+]
+
+
+# target-level modules (run once on main URL, not per-endpoint)
+TARGET_MODULES = [
+    ("takeover", takeover.scan_endpoint),
+    ("clickjack", clickjack.scan_endpoint),
+    ("header_rce", header_rce.scan_endpoint),
 ]
 
 
@@ -134,9 +143,18 @@ async def run_stage(ctx: ScanCtx, stage: str):
         endpoints = await crawler.run()
         ctx._progress(f"discovery: {len(endpoints)} endpoints, {len(crawler.visited)} pages")
         ctx.endpoints = [
-            {"url": ep.url, "method": ep.method, "params": ep.params}
+            {"url": ep.url, "method": ep.method, "params": ep.params,
+             "content_type": ep.content_type, "source": ep.source,
+             "is_login": ep.is_login, "has_file_upload": ep.has_file_upload,
+             "priority": ep.priority}
             for ep in endpoints
         ]
+        if crawler.auth_surfaces:
+            ctx._progress(f"discovery: {len(crawler.auth_surfaces)} login form(s) detected (auth surfaces)")
+            for a in crawler.auth_surfaces:
+                ctx._progress(f"discovery: auth surface: {a['method']} {a['url']} fields={','.join(a['fields'])}")
+        if crawler.frameworks:
+            ctx._progress(f"discovery: SPA frameworks: {', '.join(crawler.frameworks)}")
 
     elif stage == "audit":
         ctx._use("audit")
@@ -283,13 +301,10 @@ async def run_endpoints_slice(ctx: ScanCtx, start_idx: int,
         ("idor_api", idor_api.scan_endpoint),
         ("jwt_adv", jwt_adv.scan_endpoint),
         ("proto_pollute", proto_pollute.scan_endpoint),
+        ("blogic", blogic.scan_endpoint),
     ]
     # target-level modules (run once on main URL, not per-endpoint)
-    TARGET_MODULES = [
-        ("takeover", takeover.scan_endpoint),
-        ("clickjack", clickjack.scan_endpoint),
-        ("header_rce", header_rce.scan_endpoint),
-    ]
+    # (defined at module top as TARGET_MODULES)
 
     async def run_mod(name: str, fn, ep: dict):
         """Run one module on one endpoint, collecting its findings."""
@@ -312,6 +327,22 @@ async def run_endpoints_slice(ctx: ScanCtx, start_idx: int,
         for findings in results:
             for f in findings:
                 ctx._emit(f)
+        # second-order XSS: for params with no reflected XSS, check if a
+        # stored payload triggers on OTHER pages (only when smart mode)
+        if config.smart and ep["params"]:
+            xss_params = {f.param for f in ctx.findings
+                          if f.type == "Cross-Site Scripting" and f.url == ep["url"]}
+            for param in ep["params"]:
+                if param in xss_params:
+                    continue
+                try:
+                    other_urls = [e["url"] for e in eps[:20] if e["url"] != ep["url"]]
+                    for f in await xss.scan_second_order(
+                            client, config, ep["url"], ep["method"],
+                            ep["params"], param, other_urls):
+                        ctx._emit(f)
+                except Exception:
+                    pass
 
     idx = start_idx
     total = len(eps)
