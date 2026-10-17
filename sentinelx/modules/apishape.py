@@ -179,6 +179,7 @@ async def scan_api_shape(client: ScanClient, config: ScanConfig,
                     if r2 and detect_db_error(r2.text):
                         findings.append(Finding(
                             type="SQL Injection", subtype="error-based (API body)",
+                            severity="critical",
                             cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
                             url=url, method=method, param=f"body.{fname}",
                             payload=payload,

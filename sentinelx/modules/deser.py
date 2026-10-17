@@ -36,6 +36,73 @@ DESER_PROBES = [
     ('{"sx":"_$$ND_FUNC$$_function(){return 7*7}()"}',
      "node", re.compile(r"49|node-serialize|_\\$\\$ND_FUNC_\\$\\$", re.I),
      "Node.js node-serialize gadget evaluated"),
+    # --- TECHNIQUE: Python pickle protocol 2 ---
+    (base64.b64encode(b"\x80\x02c__builtin__\neval\n(S'1+1'\ntR."),
+     "pickle", re.compile(r"pickle|unpickl", re.I),
+     "Python pickle proto2 error"),
+    # --- TECHNIQUE: PHP magic-method probe ---
+    ('O:4:"Test":1:{s:2:"sx";s:4:"test";}',
+     "php", re.compile(r"__wakeup|__destruct|unserialize", re.I),
+     "PHP magic-method probe"),
+    # --- TECHNIQUE: PHP phar wrapper ---
+    ("phar:///tmp/sx.phar/test.txt",
+     "php", re.compile(r"phar|unserialize", re.I),
+     "PHP phar deserialization probe"),
+    # --- TECHNIQUE: Java XMLDecoder ---
+    ('<java><object class="java.lang.ProcessBuilder"></object></java>',
+     "java", re.compile(r"XMLDecoder|java\.beans", re.I),
+     "Java XMLDecoder probe"),
+    # --- TECHNIQUE: Ruby Marshal ---
+    (base64.b64encode(b"\x04\x08o:\x0bTest\x06:\x08sx"),
+     "ruby", re.compile(r"marshal|TypeError", re.I),
+     "Ruby Marshal probe"),
+    # --- TECHNIQUE: Ruby YAML (psych) ---
+    ("--- !ruby/object:Test\nsx: probe",
+     "ruby", re.compile(r"psych|syck|Tried to load unspecified class", re.I),
+     "Ruby YAML deserialization probe"),
+    # --- TECHNIQUE: .NET BinaryFormatter ---
+    (base64.b64encode(bytes.fromhex("0001000000ffffffff01000000")),
+     "dotnet", re.compile(r"BinaryFormatter|SerializationException", re.I),
+     ".NET BinaryFormatter probe"),
+    # --- TECHNIQUE: Python YAML ---
+    ("!!python/object/apply:os.system ['echo sx']",
+     "python-yaml", re.compile(r"yaml|constructor|apply", re.I),
+     "Python YAML deserialization probe"),
+    # --- TECHNIQUE: Hessian binary ---
+    (base64.b64encode(b"H\x02\x00"),
+     "hessian", re.compile(r"hessian", re.I),
+     "Hessian deserialization probe"),
+    # --- TECHNIQUE: JSON __proto__ (Node) ---
+    ('{"__proto__":{"sx":"probe"}}',
+     "node", re.compile(r"prototype|pollut", re.I),
+     "JSON __proto__ probe"),
+    # --- TECHNIQUE: PHP session format ---
+    ('sx|s:5:"probe";',
+     "php", re.compile(r"session|unserialize", re.I),
+     "PHP session deserialization probe"),
+    # --- TECHNIQUE: Python dill ---
+    (base64.b64encode(b"\x80\x02cdill.dill\n_apply"),
+     "pickle", re.compile(r"pickle|dill", re.I),
+     "Python dill probe"),
+    # --- TECHNIQUE: Node.js serialize-javascript ---
+    ('{"sx":"eval(\\"49\\")"}',
+     "node", re.compile(r"49|serialize", re.I),
+     "serialize-javascript probe"),
+    # --- TECHNIQUE: Java RMI ---
+    (base64.b64encode(bytes.fromhex("4a524d4900024b")),
+     "java", re.compile(r"RMI|UnmarshalException", re.I),
+     "Java RMI probe"),
+    # --- TECHNIQUE: .NET SoapFormatter ---
+    ('<SOAP-ENV:Envelope><a>probe</a></SOAP-ENV:Envelope>',
+     "dotnet", re.compile(r"SoapFormatter|SerializationException", re.I),
+     ".NET SoapFormatter probe"),
+    # --- TECHNIQUE: PHP WDDX ---
+    ('<wddxPacket><data><string>probe</string></data></wddxPacket>',
+     "php", re.compile(r"wddx|deserialize", re.I),
+     "PHP WDDX probe"),
+    # --- TECHNIQUE: CSV formula (client-side) ---
+    ("=1+1", "csv", re.compile(r"formula|csv.*inject", re.I),
+     "CSV formula probe"),
 ]
 
 COOKIE_NAMES = ["session", "sess", "data", "state", "user", "auth", "token", "profile"]
@@ -79,7 +146,9 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
             resp, full, body_sent = await send_fn(val)
             if not resp:
                 continue
-            m = err_rx.search(resp.text)
+            # strip our payload: error must NOT be our own reflection
+            clean = resp.text.replace(val, "")
+            m = err_rx.search(clean)
             # node-serialize: check arithmetic actually evaluated (49)
             # but exclude cases where payload echoed verbatim
             if lang == "node" and m and "49" in resp.text and "_$$ND_FUNC$$_" not in resp.text:
@@ -88,9 +157,9 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 continue
             elif not m:
                 continue
-            # signal 2: confirm with resend
+            # signal 2: confirm with resend (payload stripped)
             resp2, _, _ = await send_fn(val)
-            if resp2 and err_rx.search(resp2.text):
+            if resp2 and err_rx.search(resp2.text.replace(val, "")):
                 ev = Evidence(
                     request_raw=raw_request(method, full, headers, body_sent),
                     response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content),
@@ -117,9 +186,9 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         for payload, lang, err_rx, desc in DESER_PROBES:
             val = payload if isinstance(payload, str) else payload.decode()
             resp = await client.post(url, data=val.encode(), dedupe=False)
-            if resp and err_rx.search(resp.text):
+            if resp and err_rx.search(resp.text.replace(val, "")):
                 r2 = await client.post(url, data=val.encode(), dedupe=False)
-                if r2 and err_rx.search(r2.text):
+                if r2 and err_rx.search(r2.text.replace(val, "")):
                     ev = Evidence(
                         request_raw=raw_request("POST", url, headers, val.encode()[:300]),
                         response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content),

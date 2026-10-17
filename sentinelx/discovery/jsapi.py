@@ -391,6 +391,18 @@ def _resolve_url_expr(js_text: str, expr: str) -> tuple[str, list[str]]:
 
     def _sub_var(name: str) -> str:
         name = name.strip()
+        # object property: e.api -> resolve var e = {api: "..."}
+        if "." in name:
+            obj, _, attr = name.partition(".")
+            objmap = _resolve_object_var(js_text, obj)
+            if objmap is not None and attr in objmap:
+                v = objmap[attr]
+                if isinstance(v, str) and not v.startswith("<"):
+                    return v
+            # unresolved property -> path param placeholder
+            if name not in path_params:
+                path_params.append(name)
+            return "{" + name + "}"
         resolved = _resolve_var(js_text, name)
         if resolved is not None:
             return resolved
@@ -451,7 +463,7 @@ def _resolve_url_expr(js_text: str, expr: str) -> tuple[str, list[str]]:
             out.append(_unquote(p))
         elif kind == "`":
             out.append(_resolve_template_part(p, js_text, path_params))
-        elif re.match(r"^[A-Za-z_$][\w$]*$", p):
+        elif re.match(r"^[A-Za-z_$][\w$.]*$", p):
             out.append(_sub_var(p))
         elif p:
             out.append(p[:60])

@@ -39,6 +39,7 @@ class ScanConfig:
     max_pages: int = 50  # crawler page limit
     smart: bool = True  # smart mode: tech-tuned payloads, priority queue, correlation
     no_wordlist: bool = True  # DEFAULT: pure dynamic discovery; wordlists only via --wordlist
+    unsafe: bool = False  # --unsafe: skip TLS cert verification (labs with self-signed certs)
     tech_stack: set = field(default_factory=set)  # populated by techfp: {"PHP", "Flask", ...}
     # web-UI extensions (all optional, safe defaults)
     custom_headers: dict = field(default_factory=dict)
@@ -111,6 +112,10 @@ class ScanClient:
         headers = {"User-Agent": self.config.user_agent}
         for k, v in (self.config.custom_headers or {}).items():
             headers[str(k)] = str(v)
+        # --auth-a bearer token applies to ALL requests (auth-walled scanning);
+        # idor.py uses auth_a vs auth_b for cross-session differential tests
+        if self.config.auth_a and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {self.config.auth_a}"
         # Tuned connection pool: keep-alive reuse, bounded connections.
         # DNS is cached by httpx's connection pool via keep-alive reuse.
         limits = httpx.Limits(
@@ -130,7 +135,7 @@ class ScanClient:
             max_redirects=self.config.max_redirects,
             headers=headers,
             cookies=self.config.custom_cookies or None,
-            verify=True,
+            verify=not self.config.unsafe,
             trust_env=False,
             limits=limits,
             http2=False,  # h2 adds handshake overhead; h1 keep-alive is faster for scanning

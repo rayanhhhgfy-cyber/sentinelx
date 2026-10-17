@@ -47,6 +47,8 @@ DB_ERRORS = [
     (r"no such (table|column)\b", "SQLite"),
     # Generic / others
     (r"SQLSTATE", "Generic SQL"), (r"Syntax error.*SQL", "Generic SQL"),
+    (r"SQL syntax error", "Generic SQL"),  # generic labs / custom messages
+    (r"database.*error.*syntax|syntax.*database.*error", "Generic SQL"),
     (r"Unclosed quotation mark", "MSSQL"),
     (r"quoted string not properly terminated", "Oracle"),
     (r"DB2 SQL error", "DB2"), (r"Sybase message", "Sybase"),
@@ -158,17 +160,17 @@ def detect_db_error(body: str) -> str | None:
 
 
 async def _send(client: ScanClient, method: str, url: str, params: dict,
-                param: str, value: str):
+                param: str, value: str, dedupe: bool = True):
     """Send request with one param replaced by value. Returns (resp, final_url, body_sent)."""
     p = dict(params); p[param] = value
     t0 = time.monotonic()
     if method == "GET":
         qs = _urlencode(p)
         full = url + ("&" if "?" in url else "?") + qs
-        resp = await client.get(full)
+        resp = await client.get(full, dedupe=dedupe)
         body = None
     else:
-        resp = await client.post(url, data=p)
+        resp = await client.post(url, data=p, dedupe=dedupe)
         full, body = url, _urlencode(p).encode()
     elapsed = time.monotonic() - t0
     return resp, full, body, elapsed
@@ -300,30 +302,47 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         sqli_confirmed = any(f.param == param and f.type == "SQL Injection"
                              for f in findings)
         if (config.safe_mode or True) and not sqli_confirmed:  # SLEEP is non-destructive
+            # FRESH baseline: the shared baseline may be minutes old (server load
+            # changes under concurrency). Measure now, right before time tests.
+            fresh_bl = await get_baseline(client, method, url, params)
+            if not fresh_bl or not fresh_bl.stable:
+                continue
+            fresh_base = fresh_bl.avg_time
+            fresh_delay = adaptive_delay(fresh_base)
             for dbname, tmpl in _order_by_tech(TIME_PAYLOADS, config):
-                payload = tmpl.format(d=int(delay))
-                # measure baseline jitter with 2 normal samples first (already have base_time)
-                t0 = time.monotonic()
+                d_int = int(fresh_delay)
+                payload = tmpl.format(d=d_int)
+                # sample 1: sleep payload (dedupe=False: timing must be real)
                 resp, full, body_sent, elapsed = await _send(
-                    client, method, url, params, param, params[param] + payload)
+                    client, method, url, params, param, params[param] + payload,
+                    dedupe=False)
                 if not resp:
                     continue
-                # confirm: second sample must also show delay
-                t1 = time.monotonic()
+                # CONTROL: normal request interleaved (detects server slowdown)
+                _, _, _, ctrl_elapsed = await _send(
+                    client, method, url, params, param, params[param],
+                    dedupe=False)
+                # sample 2: sleep payload again (dedupe=False)
                 resp2, _, _, elapsed2 = await _send(
-                    client, method, url, params, param, params[param] + payload)
+                    client, method, url, params, param, params[param] + payload,
+                    dedupe=False)
                 if not resp2:
                     continue
-                # delay counts if both samples exceed baseline + delay*0.7
-                # and baseline itself was fast (< delay*0.5)
-                threshold = base_time + delay * 0.7
-                if (elapsed >= threshold and elapsed2 >= threshold
-                        and base_time < delay * 0.5):
+                # STRICT: sleep samples must take ~d_int seconds; control must
+                # be fast (proves the server isn't just slow right now).
+                # Upper bound is TIGHT (1.5x): real pg_sleep(d) is precise;
+                # server slowness under load is random and won't hit [0.8d, 1.5d]
+                # twice with a fast control in between.
+                lo, hi = d_int * 0.8, d_int * 1.5
+                if (lo <= elapsed <= hi and lo <= elapsed2 <= hi
+                        and ctrl_elapsed < d_int * 0.5
+                        and fresh_base < d_int * 0.5):
                     ev = _evidence(method, full, headers, body_sent, resp)
                     ev.proof = (f"Response delayed {elapsed:.1f}s and {elapsed2:.1f}s "
                                 f"(baseline {base_time:.2f}s) with {dbname} time payload")
                     findings.append(Finding(
                         type="SQL Injection", subtype="time-blind",
+                        severity="critical",
                         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
                         confidence=0.85, url=full, method=method, param=param,
                         payload=payload, evidence=ev, cwe="CWE-89",

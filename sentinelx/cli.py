@@ -105,6 +105,7 @@ def main(argv=None) -> int:
         oob_domain=args.oob_domain, auth_a=args.auth_a, auth_b=args.auth_b,
         max_pages=args.max_pages, smart=not args.no_smart,
         no_wordlist=not args.wordlist,  # --no-wordlist is deprecated (now default)
+        unsafe=args.unsafe,
     )
     unsafe = args.unsafe
 

@@ -16,12 +16,56 @@ from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
 
 # (payload, expected_marker_if_evaluated, engine_hint)
 SSTI_PROBES = [
+    # --- TECHNIQUE: Jinja2/Twig arithmetic ---
     ("{{7*7}}", "49", "Jinja2/Twig"),
-    ("${7*7}", "49", "Freemarker/Velocity"),
-    ("<%= 7*7 %>", "49", "ERB"),
-    ("#{7*7}", "49", "Ruby"),
-    ("*{7*7}", "49", "Thymeleaf"),
     ("{{7*'7'}}", "7777777", "Jinja2 string concat"),
+    ("{{7+7}}", "14", "Jinja2/Twig addition"),
+    ("{{'a'*3}}", "aaa", "Jinja2 string repeat"),
+    # --- TECHNIQUE: Freemarker/Velocity ---
+    ("${7*7}", "49", "Freemarker/Velocity"),
+    ("${7+7}", "14", "Freemarker addition"),
+    # --- TECHNIQUE: ERB (Ruby) ---
+    ("<%= 7*7 %>", "49", "ERB"),
+    ("<%= 7+7 %>", "14", "ERB addition"),
+    # --- TECHNIQUE: Ruby string interpolation ---
+    ("#{7*7}", "49", "Ruby"),
+    # --- TECHNIQUE: Thymeleaf ---
+    ("*{7*7}", "49", "Thymeleaf"),
+    # --- TECHNIQUE: Smarty (PHP) ---
+    ("{7*7}", "49", "Smarty"),
+    ("{$smarty.version}", "Smarty", "Smarty version leak"),
+    # --- TECHNIQUE: Tornado ---
+    ("{{7*7}}", "49", "Tornado"),
+    # --- TECHNIQUE: Mako ---
+    ("${7*7}", "49", "Mako"),
+    ("<% x=7*7 %>${x}", "49", "Mako assignment"),
+    # --- TECHNIQUE: Blade (Laravel) ---
+    ("{{7*7}}", "49", "Blade"),
+    # --- TECHNIQUE: Handlebars ---
+    ("{{7*7}}", "49", "Handlebars"),
+    # --- TECHNIQUE: Mustache ---
+    ("{{7*7}}", "49", "Mustache"),
+    # --- TECHNIQUE: EJS ---
+    ("<%= 7*7 %>", "49", "EJS"),
+    # --- TECHNIQUE: Pug/Jade ---
+    ("#{7*7}", "49", "Pug interpolation"),
+    ("p= 7*7", "49", "Pug buffered code"),
+    # --- TECHNIQUE: Django templates ---
+    ("{{7*7}}", "49", "Django"),
+    ("{% widthratio 7 1 7 %}", "49", "Django widthratio"),
+    # --- TECHNIQUE: Genshi ---
+    ("${7*7}", "49", "Genshi"),
+    # --- TECHNIQUE: Cheetah ---
+    ("#set $x = 7*7\n$x", "49", "Cheetah"),
+    # --- TECHNIQUE: Velocity macro ---
+    ("#set($x=7*7)$x", "49", "Velocity set"),
+    # --- TECHNIQUE: JSP EL ---
+    ("${7*7}", "49", "JSP EL"),
+    ("#{7*7}", "49", "JSP deferred"),
+    # --- TECHNIQUE: Pebble ---
+    ("{{7*7}}", "49", "Pebble"),
+    # --- TECHNIQUE: Razor (ASP.NET) ---
+    ("@(7*7)", "49", "Razor"),
 ]
 
 ENGINE_ERRORS = [
@@ -84,8 +128,10 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                     ))
                     break
             # engine error disclosure (single signal + error = finding)
+            # strip our payload first: the error must NOT be our own reflection
+            clean_text = resp.text.replace(payload, "")
             for rx, eng in ENGINE_ERRORS:
-                if rx.search(resp.text):
+                if rx.search(clean_text):
                     ev = Evidence(
                         request_raw=raw_request(method, full, headers, body_sent),
                         response_raw=raw_response(resp.status_code, dict(resp.headers), resp.content),
