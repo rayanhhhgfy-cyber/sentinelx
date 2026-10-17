@@ -521,9 +521,12 @@ def _resolve_function_wrappers(js_text: str) -> list[str]:
                 out.append(resolved)
     # arrow functions: const t = (u) => fetch(BASE+u)
     for m in re.finditer(
-            r"""(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>\s*(?:\{[^}]{1,2000}\}|[^;]{1,500})""",
+            r"""(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>\s*(\{[^}]{1,2000}\}|[^;]{1,500})""",
             js_text):
-        fname, arg, body = m.group(1), m.group(2), m.group(3)
+        try:
+            fname, arg, body = m.group(1), m.group(2), m.group(3)
+        except IndexError:
+            continue
         fm = re.search(r"""\bfetch\s*\(\s*([^,)]+)""", body)
         if not fm or arg not in fm.group(1):
             continue
@@ -859,8 +862,12 @@ class Crawler:
         if "javascript" in ctype or url.endswith(".js"):
             self.js_urls.add(clean)
             # parse bundles concurrently: CPU-bound regex work offloaded so
-            # the 10-way download batch isn't serialized on parsing
-            await asyncio.to_thread(self._process_js, resp.text, url)
+            # the 10-way download batch isn't serialized on parsing.
+            # Isolated: a JS parsing crash must not abandon the page.
+            try:
+                await asyncio.to_thread(self._process_js, resp.text, url)
+            except Exception:
+                pass
             return []
 
         if "html" not in ctype and "text" not in ctype:
@@ -949,7 +956,10 @@ class Crawler:
         # their own query strings (via split_params); mining the full HTML
         # causes param pollution (e.g. ?next= from the nav landing on /about).
         for script in parser.scripts:
-            self._process_js(script, url)
+            try:
+                self._process_js(script, url)
+            except Exception:
+                pass
 
         # JS execution in the virtual browser (pure Python, no headless
         # browser): for SPA pages or scripts with sink/source patterns,
@@ -1084,7 +1094,12 @@ class Crawler:
             c, p = split_params(ep_url)
             self.add_endpoint(Endpoint(url=c, params=p, source="js-concat"))
         # API-client wrapper functions: t("/products") -> "/api/products"
-        for resolved in _resolve_function_wrappers(js_text):
+        # isolated: a regex bug here must never kill the rest of JS processing
+        try:
+            _wrappers = _resolve_function_wrappers(js_text)
+        except Exception:
+            _wrappers = []
+        for resolved in _wrappers:
             path = resolved.replace("{p}", "1")
             ep_url = urljoin(base_url, path)
             if not self.in_scope(ep_url) or should_skip(ep_url):
@@ -1117,8 +1132,13 @@ class Crawler:
         self.storage_keys.update(mine_storage_keys(js_text))
         self.header_names.update(mine_header_names(js_text))
         # deep API reconstruction: full request shapes (method+headers+body),
-        # cached by content hash so a bundle is parsed once
-        self._process_jsapi(js_text, base_url)
+        # cached by content hash so a bundle is parsed once.
+        # CRITICAL: this is the highest-value JS extraction — it must run even
+        # if an earlier extractor above threw (hence the isolation).
+        try:
+            self._process_jsapi(js_text, base_url)
+        except Exception:
+            pass
 
     def _process_jsapi(self, js_text: str, base_url: str):
         """Convert jsapi.ApiCall reconstructions into enriched endpoints."""
