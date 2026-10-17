@@ -11,9 +11,38 @@ from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
 
 
 REDIRECT_PAYLOADS = [
-    "//evil-sentinelx.example", "https://evil-sentinelx.example",
-    "http://evil-sentinelx.example", "/%2F%2Fevil-sentinelx.example",
-    "https:evil-sentinelx.example", "//evil-sentinelx.example/%2F..",
+    # --- TECHNIQUE: scheme-relative ---
+    "//evil-sentinelx.example", "//evil-sentinelx.example/%2F..",
+    # --- TECHNIQUE: absolute URLs ---
+    "https://evil-sentinelx.example", "http://evil-sentinelx.example",
+    # --- TECHNIQUE: encoding tricks ---
+    "/%2F%2Fevil-sentinelx.example", "/%5cevil-sentinelx.example",
+    "%2f%2fevil-sentinelx.example", "//evil-sentinelx.example%2f..",
+    "//evil-sentinelx.example%09",
+    # --- TECHNIQUE: scheme confusion ---
+    "https:evil-sentinelx.example", "https:/evil-sentinelx.example",
+    "http:evil-sentinelx.example", "javascript:alert(1)",
+    # --- TECHNIQUE: backslash ---
+    "\\\\evil-sentinelx.example", "/\\evil-sentinelx.example",
+    "\\/\\/evil-sentinelx.example",
+    # --- TECHNIQUE: userinfo abuse ---
+    "https://trusted.example@evil-sentinelx.example",
+    "https://evil-sentinelx.example%40trusted.example",
+    "//trusted.example@evil-sentinelx.example",
+    # --- TECHNIQUE: subdomain tricks ---
+    "https://evil-sentinelx.example.trusted.example",
+    "https://trusted.example.evil-sentinelx.example",
+    # --- TECHNIQUE: whitespace/control ---
+    "//evil-sentinelx.example%20", "//evil-sentinelx.example%0a",
+    " //evil-sentinelx.example",
+    # --- TECHNIQUE: dot tricks ---
+    "https://evil-sentinelx.example.", "//evil-sentinelx.example./x",
+    # --- TECHNIQUE: param pollution ---
+    "?next=https://evil-sentinelx.example",
+    # --- TECHNIQUE: data/javascript ---
+    "data:text/html,<script>alert(1)</script>",
+    # --- TECHNIQUE: double slash path ---
+    "///evil-sentinelx.example", "////evil-sentinelx.example",
 ]
 
 REMEDIATION_REDIRECT = (
