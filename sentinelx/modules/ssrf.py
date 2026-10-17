@@ -128,4 +128,47 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 remediation=REMEDIATION_SSRF,
                 references=["https://owasp.org/www-community/attacks/Server_Side_Request_Forgery"],
             ))
+
+    # --- runtime evidence layer (jsruntime): does page JS fetch internal URLs?
+    # This does NOT replace the payload probing above; it adds corroborating
+    # evidence when the page's own JavaScript reaches internal/metadata hosts.
+    try:
+        from sentinelx.jsruntime import assists as _assists
+        _rt = await _assists.analyze_page(client, config, url, timeout=6.0)
+        if _rt and _rt.executed:
+            _internal = _rt.fetches_url_pattern(
+                r"169\.254\.169\.254|metadata\.google|100\.100\.100\.200|"
+                r"localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.")
+            seen_rt: set[str] = set()
+            for ep in _internal:
+                eu = ep.get("url", "")
+                if eu in seen_rt:
+                    continue
+                seen_rt.add(eu)
+                _ev = Evidence(
+                    request_raw=raw_request("GET", url, headers, None),
+                    response_raw="",
+                    proof=(f"Page JavaScript performs {ep.get('method', 'GET')} "
+                           f"to internal URL: {eu} (observed via real JS "
+                           f"execution). Pages whose JS reaches internal "
+                           f"hosts are SSRF-prone surfaces."),
+                )
+                _f = Finding(
+                    type="Server-Side Request Forgery",
+                    subtype="ssrf-js-internal-fetch",
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+                    confidence=0.45, url=url, method="GET", param="",
+                    evidence=_ev, cwe="CWE-918",
+                    owasp="A10:2021 – SSRF",
+                    remediation=REMEDIATION_SSRF,
+                    references=["https://owasp.org/www-community/attacks/Server_Side_Request_Forgery"],
+                )
+                _f.set_confidence("LOW")
+                _f.static_only = False
+                _f.source = "page-javascript"
+                _f.sink = "net:fetch"
+                findings.append(_f)
+    except Exception:
+        pass  # runtime layer is assist-only; never break the core detector
+
     return findings
