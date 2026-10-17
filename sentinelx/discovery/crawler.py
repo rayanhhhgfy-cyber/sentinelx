@@ -40,11 +40,22 @@ class Endpoint:
     has_file_upload: bool = False   # form has file input
     csrf_token: str = ""            # extracted CSRF token name=value if found
     priority: int = 0               # higher = scan first
+    # --- full API request shape (jsapi.ApiCall reconstruction) ---
+    headers: dict = field(default_factory=dict)    # custom headers the app's JS sends
+    json_body: dict = field(default_factory=dict)  # JSON body {field: example}
+    path_params: list = field(default_factory=list)  # templated path segments, e.g. ["id"]
 
     def key(self) -> str:
         u = urlsplit(self.url)
         base = urlunsplit((u.scheme, u.netloc, u.path.rstrip("/") or "/", "", ""))
         return f"{self.method}|{base}|{','.join(sorted(self.params))}"
+
+    def has_api_shape(self) -> bool:
+        """True if this endpoint carries a reconstructed request shape
+        (custom headers or a JSON body) worth replaying verbatim."""
+        return bool(self.json_body) or any(
+            k.lower() not in ("content-type", "accept")
+            for k in self.headers)
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +448,7 @@ class Crawler:
         self.header_names: set[str] = set()   # custom header names mined from JS
         self.ws_urls: set[str] = set()         # websocket URLs mined from JS
         self.js_urls: set[str] = set()          # JS bundle URLs actually downloaded
+        self.api_calls: list = []              # full ApiCall reconstructions (jsapi)
 
     def in_scope(self, url: str) -> bool:
         u = urlsplit(url)
@@ -453,8 +465,20 @@ class Crawler:
         k = ep.key()
         if k not in self.endpoints:
             self.endpoints[k] = ep
-        elif ep.priority > self.endpoints[k].priority:
-            self.endpoints[k].priority = ep.priority
+        else:
+            # merge: keep highest priority and richest request shape
+            cur = self.endpoints[k]
+            if ep.priority > cur.priority:
+                cur.priority = ep.priority
+            for hk, hv in ep.headers.items():
+                cur.headers.setdefault(hk, hv)
+            for bk, bv in ep.json_body.items():
+                cur.json_body.setdefault(bk, bv)
+            for pp in ep.path_params:
+                if pp not in cur.path_params:
+                    cur.path_params.append(pp)
+            if ep.content_type and not cur.content_type:
+                cur.content_type = ep.content_type
 
     async def fetch_robots(self):
         if self.config.ignore_robots:
@@ -544,7 +568,9 @@ class Crawler:
         # JS files: download + extract endpoints + SPA routes + API bases + mined params
         if "javascript" in ctype or url.endswith(".js"):
             self.js_urls.add(clean)
-            self._process_js(resp.text, url)
+            # parse bundles concurrently: CPU-bound regex work offloaded so
+            # the 10-way download batch isn't serialized on parsing
+            await asyncio.to_thread(self._process_js, resp.text, url)
             return []
 
         if "html" not in ctype and "text" not in ctype:
@@ -585,6 +611,20 @@ class Crawler:
             if self.in_scope(curl):
                 c, p = split_params(curl)
                 self.add_endpoint(Endpoint(url=c, params=p, source="comment"))
+
+        # HTML-embedded API references: data-api/data-endpoint attributes,
+        # <script type="application/json"> blobs, window.__DATA__ assignments
+        try:
+            from sentinelx.discovery import jsapi as _jsapi_html
+            for ac in _jsapi_html.extract_html_apis(resp.text, url):
+                if not self.in_scope(ac.url) or should_skip(ac.url):
+                    continue
+                c, p = split_params(ac.url)
+                for k, v in ac.query_params.items():
+                    p.setdefault(k, v)
+                self.add_endpoint(Endpoint(url=c, params=p, source="html-api"))
+        except Exception:
+            pass
 
         # deep form analysis
         for form in parser.forms:
@@ -665,10 +705,31 @@ class Crawler:
             c, p = split_params(u.split("#")[0])
             if should_skip(c):
                 continue
+            # runtime-observed full shape: headers + body from the mock trace
+            rt_headers = {}
+            try:
+                for hk, hv in (call.get("headers") or {}).items():
+                    if isinstance(hk, str) and hk:
+                        rt_headers[hk] = str(hv)[:300]
+            except Exception:
+                pass
+            rt_body_fields: dict = {}
+            body = call.get("body")
+            if isinstance(body, str) and body.strip().startswith("{"):
+                try:
+                    import json as _json
+                    _bd = _json.loads(body)
+                    if isinstance(_bd, dict):
+                        rt_body_fields = {k: (v if isinstance(v, (str, int, float, bool)) else str(v)[:80])
+                                          for k, v in list(_bd.items())[:20]}
+                except Exception:
+                    pass
             self.add_endpoint(Endpoint(
                 url=c, method=call.get("method", "GET"), params=p,
                 source="js-exec",
                 content_type="application/json" if "/api/" in c else "",
+                headers=rt_headers,
+                json_body=rt_body_fields,
             ))
         base = f"{self.target_scheme}://{self.target_host}"
         for route in result.routes:
@@ -731,6 +792,49 @@ class Crawler:
         # storage keys + custom header names: mined intel for modules
         self.storage_keys.update(mine_storage_keys(js_text))
         self.header_names.update(mine_header_names(js_text))
+        # deep API reconstruction: full request shapes (method+headers+body),
+        # cached by content hash so a bundle is parsed once
+        self._process_jsapi(js_text, base_url)
+
+    def _process_jsapi(self, js_text: str, base_url: str):
+        """Convert jsapi.ApiCall reconstructions into enriched endpoints."""
+        try:
+            from sentinelx.discovery import jsapi as _jsapi
+        except ImportError:
+            return
+        try:
+            calls = _jsapi.extract_api_calls_cached(
+                js_text, base_url, source_file=base_url)
+        except Exception:
+            return
+        for ac in calls:
+            self.api_calls.append(ac)
+            try:
+                url = ac.resolved_url(base_url)
+            except Exception:
+                continue
+            if not self.in_scope(url) or should_skip(url):
+                continue
+            clean, qs = split_params(url)
+            params = dict(ac.query_params)
+            for k, v in qs.items():
+                params.setdefault(k, v)
+            ep = Endpoint(
+                url=clean, method=ac.method or "GET", params=params,
+                source="js-api",
+                content_type=ac.content_type or (
+                    "application/json" if ac.body_fields else ""),
+                headers=dict(ac.headers),
+                json_body={k: (v if not isinstance(v, str) or not v.startswith("<") else "test")
+                           for k, v in ac.body_fields.items()},
+                path_params=list(ac.path_params),
+            )
+            # API endpoints are high-value: boost priority
+            ep.priority = max(score_priority(clean), 90)
+            self.add_endpoint(ep)
+        # dynamic traces from Node execution also carry headers/bodies now;
+        # merge any richer shape observed at runtime
+        # (handled in _process_js_execution below)
 
     async def run(self) -> list[Endpoint]:
         max_pages = getattr(self.config, "max_pages", 50)
