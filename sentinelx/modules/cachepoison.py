@@ -20,9 +20,40 @@ def _buster() -> str:
 
 
 POISON_HEADERS = [
+    # --- TECHNIQUE: host header poisoning ---
     {"X-Forwarded-Host": "evil-sentinelx.example"},
     {"X-Host": "evil-sentinelx.example"},
+    {"X-Forwarded-Server": "evil-sentinelx.example"},
+    # --- TECHNIQUE: scheme downgrade ---
     {"X-Forwarded-Scheme": "http"},
+    {"X-Forwarded-Proto": "http"},
+    {"X-Forwarded-Ssl": "off"},
+    {"Front-End-Https": "off"},
+    # --- TECHNIQUE: port confusion ---
+    {"X-Forwarded-Port": "8080"},
+    {"X-Forwarded-Host": "evil-sentinelx.example:8080"},
+    # --- TECHNIQUE: unkeyed input vectors ---
+    {"X-Original-URL": "/poisoned-sx-test"},
+    {"X-Rewrite-URL": "/poisoned-sx-test"},
+    # --- TECHNIQUE: user-agent / referer (often unkeyed) ---
+    {"User-Agent": "sx-poison-marker-1"},
+    {"Referer": "https://evil-sentinelx.example/"},
+    # --- TECHNIQUE: cookie tossing ---
+    {"Cookie": "sx_poison_marker=1"},
+    # --- TECHNIQUE: accept / language ---
+    {"Accept": "text/sx-poison"},
+    {"Accept-Language": "sx-poison"},
+    # --- TECHNIQUE: forwarded chain ---
+    {"Forwarded": "for=1.2.3.4;host=evil-sentinelx.example"},
+    {"X-Forwarded-For": "evil-sentinelx.example"},
+    # --- TECHNIQUE: method override ---
+    {"X-HTTP-Method-Override": "POST"},
+]
+
+# --- TECHNIQUE: unkeyed query params ---
+POISON_PARAMS = [
+    "utm_source", "utm_medium", "utm_campaign", "fbclid", "gclid",
+    "msclkid", "_", "cachebuster", "sxcb", "x", "dummy",
 ]
 
 REMEDIATION_CACHE = (
@@ -76,6 +107,37 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N",
                 confidence=0.85, url=pwn_url, method="GET", param="",
                 payload=str(pheaders), evidence=ev, cwe="CWE-444",
+                owasp="A05:2021 – Security Misconfiguration",
+                remediation=REMEDIATION_CACHE,
+                references=["https://portswigger.net/web-security/web-cache-poisoning"],
+            ))
+            break
+
+    # --- TECHNIQUE: unkeyed query params ---
+    # Some caches ignore specific params (utm_*, etc.) — inject a marker
+    # via the param; if the marker is cached and served to a clean request,
+    # the param is unkeyed and exploitable.
+    for pname in POISON_PARAMS:
+        buster = _buster()
+        sep = "&" if "?" in url else "?"
+        pwn_url = f"{url}{sep}cb={buster}&{pname}=evil-sentinelx.example"
+        r1 = await client.request("GET", pwn_url, headers=headers, dedupe=False)
+        if not r1 or "evil-sentinelx.example" not in r1.text:
+            continue
+        clean_url = f"{url}{sep}cb={buster}"
+        r2 = await client.request("GET", clean_url, headers=headers, dedupe=False)
+        if r2 and "evil-sentinelx.example" in r2.text:
+            ev = Evidence(
+                request_raw=raw_request("GET", pwn_url, headers, None),
+                response_raw=raw_response(r2.status_code, dict(r2.headers), r2.content),
+                proof=(f"Cache poisoning via unkeyed param confirmed (2/2): "
+                       f"param '{pname}' not part of cache key"),
+            )
+            findings.append(Finding(
+                type="Web Cache Poisoning", subtype="unkeyed-param",
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N",
+                confidence=0.85, url=pwn_url, method="GET", param=pname,
+                payload=f"{pname}=evil-sentinelx.example", evidence=ev, cwe="CWE-444",
                 owasp="A05:2021 – Security Misconfiguration",
                 remediation=REMEDIATION_CACHE,
                 references=["https://portswigger.net/web-security/web-cache-poisoning"],
