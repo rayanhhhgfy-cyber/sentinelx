@@ -186,6 +186,26 @@ def _evidence(method, url, req_headers, body_sent, resp) -> Evidence:
     )
 
 
+def _norm(body: str, sent_value: str) -> str:
+    """Normalize reflected input out of a response body.
+
+    Replaces the sent value (and its HTML-escaped / URL-encoded variants)
+    with a placeholder, so differential checks compare DATA not echoed input.
+    Used by boolean-blind and UNION-based detection.
+    """
+    variants = {
+        sent_value,
+        _html.escape(sent_value),
+        (sent_value.replace("&", "&#38;").replace("'", "&#39;")
+         .replace('"', "&#34;").replace("<", "&#60;").replace(">", "&#62;")),
+        _quote(sent_value, safe=""),
+    }
+    for v in variants:
+        if v:
+            body = body.replace(v, "SXNORM")
+    return body
+
+
 async def _test_cookies(client: ScanClient, config: ScanConfig,
                         method: str, url: str, params: dict) -> list[Finding]:
     """Cookie-based SQLi (PortSwigger TrackingId pattern).
@@ -461,25 +481,35 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
 
         # ---- 2. boolean-blind: TRUE vs FALSE, 3 samples each ----
         # (skip if error-based already confirmed SQLi on this param)
+        # NOTE: pages that reflect the input param (search/filter headings)
+        # break naive TRUE-vs-baseline similarity. We normalize the reflected
+        # input out of all bodies before comparing, so we compare DATA not echo.
         sqli_confirmed = any(f.param == param and f.type == "SQL Injection"
                              for f in findings)
         if not sqli_confirmed:
             true_bodies, false_bodies = [], []
+            true_sent = params[param] + BOOLEAN_TRUE[0]
+            false_sent = params[param] + BOOLEAN_FALSE[0]
             for _ in range(3):
                 rt, full_t, _, _ = await _send(
-                    client, method, url, params, param, params[param] + BOOLEAN_TRUE[0])
+                    client, method, url, params, param, true_sent)
                 rf, full_f, _, _ = await _send(
-                    client, method, url, params, param, params[param] + BOOLEAN_FALSE[0])
+                    client, method, url, params, param, false_sent)
                 if rt: true_bodies.append(rt.text)
                 if rf: false_bodies.append(rf.text)
             if len(true_bodies) == 3 and len(false_bodies) == 3:
                 true_stable = len(set(true_bodies)) == 1
                 false_stable = len(set(false_bodies)) == 1
                 differ = true_bodies[0] != false_bodies[0]
+                # Normalize reflected input out before baseline comparison:
+                # compare the DATA, not the echoed payload text.
+                norm_base = _norm(base_body, params[param])
+                norm_true = _norm(true_bodies[0], true_sent)
+                norm_false = _norm(false_bodies[0], false_sent)
                 true_matches_base, _ = is_significant_change(
-                    base_body, true_bodies[0], base_status, base_status)
+                    norm_base, norm_true, base_status, base_status)
                 false_differs, _ = is_significant_change(
-                    base_body, false_bodies[0], base_status, base_status)
+                    norm_base, norm_false, base_status, base_status)
                 if true_stable and false_stable and differ and not true_matches_base and false_differs:
                     resp, full, body_sent, _ = await _send(
                         client, method, url, params, param, params[param] + BOOLEAN_TRUE[0])
@@ -598,18 +628,7 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                     break
 
         # ---- 5. UNION-based ----
-        def _norm(body: str, sent_value: str) -> str:
-            variants = {
-                sent_value,
-                _html.escape(sent_value),
-                (sent_value.replace("&", "&#38;").replace("'", "&#39;")
-                 .replace('"', "&#34;").replace("<", "&#60;").replace(">", "&#62;")),
-                _quote(sent_value, safe=""),
-            }
-            for v in variants:
-                if v:
-                    body = body.replace(v, "SXNORM")
-            return body
+        # (_norm is module-level, shared with boolean-blind)
 
         col_count, ctx_quote = 0, ""
         for q in ("'", ""):

@@ -57,8 +57,12 @@ REDIRECT_PARAM_NAMES = re.compile(
 )
 
 AUTH_PARAM_NAMES = re.compile(
-    r"token|auth|session|password|passwd|secret|apikey|api_key|"
-    r"access_token|jwt",
+    r"token|auth|session|password|passwd|pwd|secret|apikey|api_key|"
+    r"access_token|jwt|"
+    # password-change / credential fields (e.g. ?current=, ?new= on change-password)
+    # \b for short generic words so "news" / "renew" don't match
+    r"current|\bnew\b|\brepeat\b|old_password|confirm|retype|credential|"
+    r"passcode|\bpin\b",
     re.I,
 )
 

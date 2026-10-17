@@ -136,9 +136,15 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     headers = {"User-Agent": config.user_agent}
 
     # targets: params that look serialized, else cookies, else skip (save requests)
+    # NOTE: no fallback to arbitrary first param — testing a plain text field
+    # (e.g. ?q=search) with deserialization payloads produces false positives.
     b64ish = [p for p in params
               if re.fullmatch(r"[A-Za-z0-9+/=]{20,}", str(params[p] or ""))]
-    test_params = b64ish or list(params)[:1]
+    # also: params whose names suggest serialized data
+    ser_names = [p for p in params
+                 if re.search(r"serial|pickle|object|data|state|viewstate", p, re.I)
+                 and p not in b64ish]
+    test_params = b64ish + ser_names
 
     async def try_probe(send_fn, label: str):
         for payload, lang, err_rx, desc in DESER_PROBES:

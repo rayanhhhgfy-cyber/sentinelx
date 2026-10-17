@@ -95,8 +95,13 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
     if not params:
         return findings
     headers = {"User-Agent": config.user_agent}
-    cmdish = [p for p in params if re.search(r"cmd|command|exec|run|ping|host|ip|domain|query", p, re.I)]
-    targets = cmdish or list(params)[:2]
+    # Only test params that plausibly reach a shell. Testing arbitrary text
+    # fields (e.g. ?challenge=test) with command payloads produces false
+    # positives. No fallback to generic params.
+    cmdish = [p for p in params if re.search(r"cmd|command|exec|run|ping|host|ip|domain|query|target|addr", p, re.I)]
+    targets = cmdish
+    if not targets:
+        return findings
 
     for param in targets:
         # shared baseline (fetched once per endpoint, reused by all modules)

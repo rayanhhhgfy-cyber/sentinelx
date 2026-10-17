@@ -260,13 +260,13 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         return findings
     headers = {"User-Agent": config.user_agent}
 
-    # Param prioritization: url-like names/values first (shared classifier),
-    # then remaining params (cap to avoid explosion).
-    ordered = url_params(params)
-    for name in params:
-        if name not in ordered:
-            ordered.append(name)
-    ordered = ordered[:4]
+    # Param prioritization: ONLY url-like params are tested for SSRF.
+    # Testing passwords/search/text fields with SSRF payloads produces
+    # false positives (e.g. ?current=http://127.0.0.1 on a password field).
+    # If no param looks like a URL, there is no SSRF attack surface here.
+    ordered = url_params(params)[:4]
+    if not ordered:
+        return findings
 
     for param in ordered:
         # ---- Phase 0: baseline (original value) ----

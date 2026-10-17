@@ -99,14 +99,32 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
         return findings
     headers = {"User-Agent": config.user_agent}
 
-    for param in params:
+    # Param-type gating: never test auth/password params for SSTI.
+    # A password field (e.g. ?current=) will never render template output,
+    # and coincidental markers ("49") in the page cause false positives.
+    from sentinelx.discovery.paramtypes import classify_param
+    testable = [p for p in params if "auth" not in classify_param(p, str(params[p]))]
+    if not testable:
+        return findings
+
+    for param in testable:
+        # Baseline check: marker must NOT appear naturally (avoids coincidental "49")
+        base_resp, _, _ = await _send(
+            client, method, url, params, param, str(params[param]))
+        base_has_marker = {}
+        if base_resp:
+            for _, marker, _ in SSTI_PROBES:
+                base_has_marker[marker] = marker in base_resp.text
         for payload, marker, engine in SSTI_PROBES:
+            # skip if marker appears in baseline (coincidental, not SSTI)
+            if base_has_marker.get(marker):
+                continue
             resp, full, body_sent = await _send(
                 client, method, url, params, param, params[param] + payload)
             if not resp:
                 continue
-            # signal 1: arithmetic evaluated (49 appears where 7*7 was sent)
-            # signal 2: must NOT appear in baseline (avoid coincidental 49)
+            # signal 1: arithmetic evaluated (marker appears where payload was sent)
+            # signal 2: marker NOT in baseline (checked above) + payload not reflected
             if marker in resp.text and payload not in resp.text:
                 # confirm with second request (2 signals: eval + confirmation)
                 r2, _, _ = await _send(
