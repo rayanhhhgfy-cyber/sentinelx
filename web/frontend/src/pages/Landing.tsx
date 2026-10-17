@@ -22,7 +22,7 @@ export default function Landing() {
       <section className="relative overflow-hidden px-4 sm:px-6 pt-20 pb-16 sm:pt-28 sm:pb-24">
         <div className="mx-auto max-w-5xl text-center">
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
-            className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white border border-slate-200 shadow-sm text-sm font-medium text-slate-600 mb-8">
+            className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-white/10 shadow-sm text-sm font-medium text-slate-600 dark:text-slate-300 mb-8">
             <span className="relative flex h-2.5 w-2.5">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
               <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
@@ -31,13 +31,13 @@ export default function Landing() {
           </motion.div>
           <motion.h1
             initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }}
-            className="text-5xl sm:text-7xl font-black tracking-tight text-slate-900 leading-[1.05]">
+            className="text-5xl sm:text-7xl font-black tracking-tight text-slate-900 dark:text-white leading-[1.05]">
             Find web vulnerabilities<br />
             <span className="grad-text">before attackers do.</span>
           </motion.h1>
           <motion.p
             initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}
-            className="mx-auto mt-6 max-w-2xl text-lg sm:text-xl text-slate-500 leading-relaxed">
+            className="mx-auto mt-6 max-w-2xl text-lg sm:text-xl text-slate-500 dark:text-slate-400 leading-relaxed">
             SentinelX is a real, working vulnerability scanner. Nineteen modules probe every endpoint,
             and each finding carries raw evidence, CVSS scoring, and a one-click reproducer.
           </motion.p>
@@ -50,7 +50,7 @@ export default function Landing() {
               <ArrowRight className="h-4 w-4 group-hover:translate-x-1 transition-transform" />
             </Link>
             <Link to="/history"
-              className="inline-flex items-center gap-2 px-8 py-4 rounded-2xl font-semibold text-slate-700 bg-white border border-slate-200 shadow-sm hover:shadow-md transition-all hover:-translate-y-1">
+              className="inline-flex items-center gap-2 px-8 py-4 rounded-2xl font-semibold text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-200 dark:border-white/10 shadow-sm hover:shadow-md transition-all hover:-translate-y-1">
               View history
             </Link>
           </motion.div>
@@ -60,12 +60,12 @@ export default function Landing() {
             className="mt-16 grid grid-cols-2 sm:grid-cols-4 gap-4 max-w-3xl mx-auto">
             {stats.map(([n, l]) => (
               <div key={l} className="glass rounded-2xl px-4 py-5">
-                <div className="text-3xl font-black text-slate-900">{n}</div>
-                <div className="text-xs font-medium text-slate-500 mt-1">{l}</div>
+                <div className="text-3xl font-black text-slate-900 dark:text-white">{n}</div>
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400 mt-1">{l}</div>
               </div>
             ))}
           </motion.div>
-          <p className="mt-4 text-xs text-slate-400">*on hardened reference target</p>
+          <p className="mt-4 text-xs text-slate-400 dark:text-slate-500">*on hardened reference target</p>
         </div>
       </section>
 
@@ -74,8 +74,8 @@ export default function Landing() {
         <div className="mx-auto max-w-7xl">
           <motion.div initial={{ opacity: 0, y: 20 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }}
             className="text-center mb-12">
-            <h2 className="text-3xl sm:text-4xl font-extrabold text-slate-900 tracking-tight">Everything a scanner should be</h2>
-            <p className="mt-3 text-slate-500 max-w-xl mx-auto">No mocks, no stubs, no placeholders. Real requests, real evidence, real findings.</p>
+            <h2 className="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight">Everything a scanner should be</h2>
+            <p className="mt-3 text-slate-500 dark:text-slate-400 max-w-xl mx-auto">No mocks, no stubs, no placeholders. Real requests, real evidence, real findings.</p>
           </motion.div>
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-5">
             {features.map((f, i) => (
@@ -85,8 +85,8 @@ export default function Landing() {
                 <div className={`inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br ${f.grad} shadow-lg mb-5`}>
                   <f.icon className="h-6 w-6 text-white" strokeWidth={2.2} />
                 </div>
-                <h3 className="text-lg font-bold text-slate-900 mb-2">{f.title}</h3>
-                <p className="text-sm text-slate-500 leading-relaxed">{f.desc}</p>
+                <h3 className="text-lg font-bold text-slate-900 dark:text-white mb-2">{f.title}</h3>
+                <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">{f.desc}</p>
               </motion.div>
             ))}
           </div>
@@ -99,7 +99,7 @@ export default function Landing() {
           <div className="glass rounded-[2rem] p-8 sm:p-12 relative overflow-hidden">
             <div className="absolute inset-0 bg-gradient-to-br from-indigo-50/50 via-transparent to-violet-50/50 pointer-events-none" />
             <div className="relative">
-              <h2 className="text-3xl font-extrabold text-slate-900 tracking-tight mb-10 text-center">Three steps to safer</h2>
+              <h2 className="text-3xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-10 text-center">Three steps to safer</h2>
               <div className="grid sm:grid-cols-3 gap-8">
                 {[
                   { icon: Shield, n: "Point", d: "Enter a target you own. Confirm ownership. Tune concurrency, rate, and depth." },
@@ -108,12 +108,12 @@ export default function Landing() {
                 ].map((s, i) => (
                   <motion.div key={s.n} initial={{ opacity: 0, y: 20 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }} transition={{ delay: i * 0.12 }}
                     className="text-center">
-                    <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white shadow-lg border border-slate-100">
+                    <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white dark:bg-slate-900 shadow-lg border border-slate-100 dark:border-white/5">
                       <s.icon className="h-7 w-7 text-indigo-600" strokeWidth={2} />
                     </div>
                     <div className="text-xs font-bold uppercase tracking-widest text-indigo-500 mb-1">Step {i + 1}</div>
-                    <h3 className="font-bold text-slate-900 mb-2">{s.n}</h3>
-                    <p className="text-sm text-slate-500 leading-relaxed">{s.d}</p>
+                    <h3 className="font-bold text-slate-900 dark:text-white mb-2">{s.n}</h3>
+                    <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">{s.d}</p>
                   </motion.div>
                 ))}
               </div>
@@ -130,7 +130,7 @@ export default function Landing() {
           <div className="relative">
             <h2 className="text-3xl sm:text-4xl font-extrabold text-white tracking-tight">Ready to find what's hiding?</h2>
             <p className="mt-3 text-indigo-100 max-w-lg mx-auto">Point SentinelX at a target you own and get a full vulnerability report in minutes.</p>
-            <Link to="/dashboard" className="mt-8 inline-flex items-center gap-2 px-8 py-4 rounded-2xl bg-white text-indigo-700 font-bold shadow-xl hover:-translate-y-1 hover:shadow-2xl transition-all">
+            <Link to="/dashboard" className="mt-8 inline-flex items-center gap-2 px-8 py-4 rounded-2xl bg-white dark:bg-slate-900 text-indigo-700 font-bold shadow-xl hover:-translate-y-1 hover:shadow-2xl transition-all">
               <Zap className="h-5 w-5" />Launch your first scan<ArrowRight className="h-4 w-4" />
             </Link>
           </div>
