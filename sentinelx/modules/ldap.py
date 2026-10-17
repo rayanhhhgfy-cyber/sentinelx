@@ -44,6 +44,15 @@ BOOLEAN_PAIRS = [
     ("*)(objectClass=*)", "*)(objectClass=zzz_no_such_class_999"),
 ]
 
+# LDAP error signatures for error-based detection
+LDAP_ERRORS = [
+    (re.compile(r"LDAP.*error", re.I), "LDAP error"),
+    (re.compile(r"error code 32", re.I), "LDAP no-such-object"),
+    (re.compile(r"Invalid DN syntax", re.I), "LDAP DN error"),
+    (re.compile(r"javax\.naming", re.I), "Java LDAP error"),
+    (re.compile(r"LDAPException", re.I), "LDAP exception"),
+]
+
 REMEDIATION_LDAP = (
     "Escape LDAP metacharacters (*, (, ), \\, NUL) in user input. Use "
     "parameterized LDAP APIs, apply least-privilege bind accounts."
