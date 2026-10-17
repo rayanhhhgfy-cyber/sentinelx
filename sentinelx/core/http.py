@@ -199,9 +199,19 @@ class ScanClient:
             try:
                 async with self.sem:
                     self.requests_made += 1
+                    # data as dict = form-encoded; bytes/str = raw body.
+                    # (Bug fix: dict was passed as content= which raises
+                    # TypeError in httpx, silently killing all form POSTs.)
+                    req_kwargs: dict = dict(
+                        params=params, json=json_data,
+                        headers=headers, cookies=cookies,
+                    )
+                    if isinstance(data, dict):
+                        req_kwargs["data"] = data
+                    elif data is not None:
+                        req_kwargs["content"] = data
                     resp = await self._client.request(
-                        method, url, params=params, content=data,
-                        json=json_data, headers=headers, cookies=cookies,
+                        method, url, **req_kwargs,
                     )
                 if resp.status_code in (429, 503):
                     bucket.backoff()

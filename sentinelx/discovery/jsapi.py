@@ -566,6 +566,17 @@ def _flatten_query(url: str) -> tuple[str, dict]:
 def _finalize(call: ApiCall, base_url: str) -> ApiCall | None:
     if not call.url:
         return None
+    # Angular/React SPA convention: this.host, this.hostServer, this.apiUrl
+    # are the app's own origin (set from runtime config). For scanning they
+    # mean "same origin" — strip them so the URL becomes relative.
+    call.url = re.sub(r"\{this\.(?:hostServer|host|apiUrl|baseUrl|apiBase)\}/?",
+                      "", call.url)
+    call.url = re.sub(r"\{this\.(?:hostServer|host|apiUrl|baseUrl|apiBase)\}$",
+                      "", call.url)
+    if not call.url or call.url == "/":
+        # URL was ONLY the host placeholder (e.g. this.http.get(this.host))
+        # — that's the app root, not an API endpoint. Skip it.
+        return None
     call.url, qs = _flatten_query(call.url)
     for k, v in qs.items():
         call.query_params.setdefault(k, v)
@@ -588,13 +599,17 @@ def extract_api_calls(js_text: str, base_url: str = "",
                       source_file: str = "") -> list[ApiCall]:
     """Deep-extract complete API calls from JS source. Never raises."""
     calls: list[ApiCall] = []
-    if not js_text or len(js_text) > 1_000_000:
+    # Real-world Angular/React bundles are 1-5MB. The old 1MB guard silently
+    # dropped ALL API extraction on sites like Juice Shop. Raised to 10MB;
+    # the regex-based extraction below is linear-time and safe at this size.
+    if not js_text or len(js_text) > 10_000_000:
         return calls
     try:
         calls.extend(_extract_fetch(js_text, base_url, source_file))
         calls.extend(_extract_axios(js_text, base_url, source_file))
         calls.extend(_extract_ajax(js_text, base_url, source_file))
         calls.extend(_extract_xhr(js_text, base_url, source_file))
+        calls.extend(_extract_httpclient(js_text, base_url, source_file))
     except Exception:
         pass
     # dedupe by (method, url)
@@ -837,6 +852,63 @@ def _extract_xhr(js_text, base_url, source_file):
                            headers=headers, body_fields=body_fields,
                            body_raw=body_raw, source_file=source_file,
                            source_line=line)
+            fin = _finalize(call, base_url)
+            if fin:
+                out.append(fin)
+        except Exception:
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Angular HttpClient: this.http.get/post/put/delete/patch(url, body?, opts?)
+# Same arg shape as axios — shared logic via _httpclient_call().
+# ---------------------------------------------------------------------------
+_HTTPCLIENT_RE = re.compile(
+    r"""\.http\.(get|post|put|delete|patch|head|options)\s*\(""")
+
+
+def _extract_httpclient(js_text, base_url, source_file):
+    """Extract Angular HttpClient calls. Never raises."""
+    out = []
+    for m in _HTTPCLIENT_RE.finditer(js_text):
+        try:
+            method = m.group(1).upper()
+            paren = js_text.index("(", m.end() - 1)
+            args, _ = _call_args(js_text, paren)
+            if not args:
+                continue
+            url, path_params = _resolve_url_expr(js_text, args[0])
+            call = ApiCall(method=method, url=url, path_params=path_params,
+                           source_file=source_file,
+                           source_line=_line_no(js_text, m.start()))
+            # POST/PUT/PATCH: second arg is the body
+            body_idx = 1 if method in ("POST", "PUT", "PATCH") else None
+            opts_idx = 2 if method in ("POST", "PUT", "PATCH") else 1
+            if body_idx is not None and len(args) > body_idx:
+                data = args[body_idx].strip()
+                if data.startswith("{"):
+                    fields, raw = _extract_body_fields(
+                        _parse_js_object_literal(data))
+                    call.body_fields.update(fields)
+                    call.body_raw = raw
+                elif data.startswith("JSON.stringify"):
+                    inner_m = re.match(r"JSON\.stringify\s*\(", data)
+                    if inner_m:
+                        inner, _ = _balanced(data, inner_m.end() - 1)
+                        if inner.strip().startswith("{"):
+                            fields, raw = _extract_body_fields(
+                                _parse_js_object_literal(inner))
+                            call.body_fields.update(fields)
+                            call.body_raw = raw
+            # options arg: {headers: {...}, params: {...}}
+            if len(args) > opts_idx and args[opts_idx].strip().startswith("{"):
+                cfg = _parse_js_object_literal(args[opts_idx])
+                if isinstance(cfg.get("headers"), dict):
+                    call.headers.update(_extract_headers_dict(cfg["headers"]))
+                if isinstance(cfg.get("params"), dict):
+                    for k, v in cfg["params"].items():
+                        call.query_params[k] = v if isinstance(v, str) and not v.startswith("<") else "test"
             fin = _finalize(call, base_url)
             if fin:
                 out.append(fin)

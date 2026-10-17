@@ -121,28 +121,36 @@ async def scan_target(client, config: ScanConfig, target: str) -> list[Finding]:
     if not host:
         return findings
 
-    # baseline: 2 clean requests (was 3 — 2 samples suffice with tight thresholds)
+    # baseline: 3 clean requests. Production hosts (CDN/WAF) have jitter;
+    # more samples + a higher bar prevents false timing hits.
     baseline_payload = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
                         f"Connection: close\r\n\r\n").encode()
     base_times = []
-    for _ in range(2):
+    for _ in range(3):
         _, el = await _raw_exchange(host, port, baseline_payload, use_tls)
         base_times.append(el)
     base_avg = sum(base_times) / len(base_times)
     base_max = max(base_times)
+    # reject noisy baselines: if the host's own responses vary wildly,
+    # timing detection is unreliable — skip rather than false-positive.
+    base_jitter = base_max - min(base_times)
+    timing_unreliable = base_jitter > 2.0
 
     for name, payload in build_probes(host, path):
         probe_times, responses = [], []
-        for _ in range(2):
+        for _ in range(3):
             data, el = await _raw_exchange(host, port, payload, use_tls)
             probe_times.append(el)
             responses.append(data)
         probe_avg = sum(probe_times) / len(probe_times)
 
-        # detection 1: timing anomaly (desync causes backend to wait)
-        # adaptive: probe must exceed baseline max + 4s on ALL samples
-        timing_hit = (probe_avg > base_max + 4.0
-                      and all(t > base_max + 3.0 for t in probe_times))
+        # detection 1: timing anomaly (desync causes backend to wait).
+        # Strict: baseline must be stable (no jitter), probe must exceed
+        # baseline max + 5s on EVERY sample (3/3). A real desync makes the
+        # backend wait 10s+; anything less is network noise on prod hosts.
+        timing_hit = (not timing_unreliable
+                      and probe_avg > base_max + 5.0
+                      and all(t > base_max + 4.0 for t in probe_times))
         # detection 2: differential response (smuggled bytes leak into reply)
         # detection 3: status anomaly vs baseline
         base_resp, _ = await _raw_exchange(host, port, baseline_payload, use_tls)
@@ -153,7 +161,13 @@ async def scan_target(client, config: ScanConfig, target: str) -> list[Finding]:
                 if b"400" in r[:30] or b"408" in r[:30]:
                     status_hit = True
 
-        if timing_hit or status_hit:
+        # A lone status difference (e.g. edge/WAF returning 400 for a
+        # malformed probe) is NOT smuggling — it's correct rejection of bad
+        # input. Only the timing anomaly proves a real desync (the backend
+        # waited for smuggled bytes). status_hit merely boosts confidence.
+        if not timing_hit:
+            continue
+        if timing_hit and status_hit:
             reason = []
             if timing_hit:
                 reason.append(f"probe avg {probe_avg:.1f}s vs baseline {base_avg:.2f}s (3/3 samples)")

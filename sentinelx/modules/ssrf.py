@@ -92,6 +92,16 @@ CLOSED_PORT_PROBE = "http://127.0.0.1:9/"
 # open-port candidates tried in order; target's own port first
 OPEN_PORT_PATHS = ["/", ]
 
+# Timing-oracle payload: a non-routable IP. If the server attempts the
+# fetch, IT waits for ITS connection timeout (typically 5-30s) — far
+# longer than the fast-fail of a closed port. A large timing gap between
+# this and the closed-port probe proves server-side fetching even when
+# the response body reveals nothing.
+TIMING_PROBE = "http://10.255.255.1/"
+# Minimum extra delay (seconds) vs closed-port probe to count as a signal.
+# Conservative: real server-side connect timeouts are 5s+.
+TIMING_THRESHOLD = 4.0
+
 
 def _open_port_probes(target_url: str) -> list[str]:
     try:
@@ -308,6 +318,25 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                     best_probe = best_probe or opr
                     break
 
+        # ---- Phase 2b: timing oracle (non-routable IP) ----
+        # If the server fetches our URL, a non-routable IP forces IT to wait
+        # for ITS connect timeout. Compare against the closed-port probe
+        # (fast fail). A large gap proves server-side fetching even when
+        # the response body is identical (the PortSwigger-lab case).
+        if closed is not None:
+            timing_probe = await _send(client, method, url, params, param,
+                                       TIMING_PROBE, headers)
+            if timing_probe is not None:
+                gap = timing_probe.elapsed - closed.elapsed
+                if gap >= TIMING_THRESHOLD and timing_probe.elapsed >= 4.0:
+                    signals.append(
+                        f"timing oracle: non-routable IP ({TIMING_PROBE}) "
+                        f"took {timing_probe.elapsed:.1f}s vs closed-port "
+                        f"{closed.elapsed:.1f}s (gap {gap:.1f}s) — server "
+                        f"waited for its own connect timeout, proving "
+                        f"server-side fetch")
+                    best_probe = best_probe or timing_probe
+
         # ---- Phase 3: bypass payloads (for naive blocklists) ----
         # Only run if Phase 1/2 suggest a fetch sink (blocklist message or
         # any signal), or if direct loopback was rejected — keeps it fast.
@@ -383,6 +412,8 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 families.add("error-oracle")
             elif s.startswith("differential"):
                 families.add("differential")
+            elif s.startswith("timing oracle"):
+                families.add("timing-oracle")
             elif s.startswith("bypass"):
                 families.add("bypass")
             elif s.startswith("content marker"):
@@ -399,9 +430,10 @@ async def scan_endpoint(client: ScanClient, config: ScanConfig,
                 0.92, "CONFIRMED"))
             continue  # param confirmed — stop (early-stop keeps it fast)
         if len(real_families) == 1 and best_probe is not None:
-            # Single strong signal: error-oracle or marker alone is HIGH,
-            # differential alone is MEDIUM (needs corroboration).
-            if "error-oracle" in families or "marker" in families:
+            # Single strong signal: error-oracle, timing-oracle, or marker
+            # alone is HIGH; differential alone is MEDIUM (needs corroboration).
+            if ("error-oracle" in families or "marker" in families
+                    or "timing-oracle" in families):
                 findings.append(_mk_finding(
                     method, best_probe, param, headers, signals,
                     0.78, "HIGH"))
