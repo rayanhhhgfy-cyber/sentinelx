@@ -1,6 +1,6 @@
-"""Tests for sentinelx.jsruntime — js2py-powered JS execution.
+"""Tests for sentinelx.jsruntime — node-powered JS execution.
 
-Covers: js2py initialization, mock browser environment, executor safety,
+Covers: node initialization, mock browser environment, executor safety,
 taint tracking, instrumentation/correlation, and false-positive discipline.
 
 Run: .venv/bin/python tests/test_jsruntime.py
@@ -11,18 +11,20 @@ from __future__ import annotations
 import sys
 
 from sentinelx.jsruntime import (
-    ensure_js2py, execute, execute_scripts,
+    ensure_node, node_available, execute, execute_scripts,
     instrument, taint as taint_mod, assists,
 )
 from sentinelx.jsruntime import mock as mock_mod
 
 
-def test_js2py_initializes():
-    ensure_js2py()  # must not raise
-    import js2py
-    ctx = js2py.EvalJs()
-    ctx.execute("var x = 40 + 2;")
-    assert int(ctx.x) == 42, "js2py basic execution broken"
+def test_node_initializes():
+    ensure_node()  # must not raise
+    assert node_available(), "node_available() false after ensure_node()"
+    import subprocess, shutil
+    node = shutil.which("node")
+    p = subprocess.run([node, "-e", "console.log(40+2)"],
+                       capture_output=True, timeout=10, text=True)
+    assert p.stdout.strip() == "42", "node basic execution broken"
 
 
 def test_mock_location_canaries():

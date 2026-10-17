@@ -54,28 +54,29 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
 
-    # js2py is a MANDATORY hard dependency (JavaScript execution engine).
+    # Node.js is a MANDATORY hard dependency (JavaScript execution engine).
     # Fail fast with a clear message — never silently disable JS analysis.
     # NOTE: this check runs BEFORE importing sentinelx.engine, because the
     # engine pulls in jsruntime at module load.
     try:
-        from sentinelx.jsruntime import ensure_js2py, execute
-        ensure_js2py()
-        # smoke-test the engine initializes (catches broken installs)
-        _smoke = execute("var __sx_smoke = 1;", timeout=5)
+        from sentinelx.jsruntime import ensure_node, execute
+        ensure_node()
+        # smoke-test the engine runs JS (catches broken installs)
+        _smoke = execute("var __sx_smoke = 1;", timeout=10)
         if not _smoke.executed and "timeout" not in " ".join(_smoke.errors).lower():
             # executed=False with non-timeout errors on trivial JS = broken engine
             raise RuntimeError("; ".join(_smoke.errors[:2]) or "engine smoke test failed")
     except RuntimeError as e:
-        console.print(f"[bold red]js2py is required but not working.[/bold red]\n{e}")
+        console.print(f"[bold red]Node.js is required but not working.[/bold red]\n{e}")
         return 2
     except ImportError as e:
-        console.print("[bold red]js2py is required.[/bold red]\n"
+        console.print("[bold red]JavaScript engine failed to load.[/bold red]\n"
                       f"Import failed: {e}\n"
-                      "Run: [bold]pip install -r requirements.txt[/bold]")
+                      "Run: [bold]pip install -r requirements.txt[/bold] and "
+                      "[bold]pkg install nodejs[/bold] (Termux)")
         return 2
 
-    # deferred imports: only after js2py is verified
+    # deferred imports: only after node is verified
     from sentinelx.core.http import ScanConfig
     from sentinelx.engine import run_scan
     from sentinelx.reports.reports import write_json, write_html
