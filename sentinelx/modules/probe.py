@@ -69,6 +69,46 @@ async def scan_openredirect(client: ScanClient, config: ScanConfig,
                     references=["https://owasp.org/www-community/attacks/Unvalidated_Redirects_and_Forwards_Cheat_Sheet"],
                 ))
                 break
+
+    # --- runtime evidence layer (jsruntime): does page JS navigate using
+    # attacker-controlled data? Proven taint flows to nav sinks raise this
+    # from heuristic to CONFIRMED client-side open redirect.
+    try:
+        from sentinelx.jsruntime import assists as _assists
+        _rt = await _assists.analyze_page(client, config, url, timeout=6.0)
+        if _rt and _rt.executed:
+            _nav_flows = [f for f in _rt.flows
+                          if f.sink.startswith("nav:")]
+            seen_nav: set[str] = set()
+            for flow in _nav_flows:
+                key = (flow.sink, flow.source_id)
+                if key in seen_nav:
+                    continue
+                seen_nav.add(key)
+                _ev = Evidence(
+                    request_raw=raw_request(method, url, headers, None),
+                    response_raw="",
+                    proof=(f"Client-side open redirect CONFIRMED by real JS "
+                           f"execution: tainted data from {flow.source}"
+                           f"({flow.source_id}) reached {flow.sink}. "
+                           f"Destination: {flow.evidence[:200]}"),
+                )
+                _f = Finding(
+                    type="Open Redirect", subtype="js-navigation-tainted",
+                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+                    confidence=0.9, url=url, method=method,
+                    param=flow.source_id, evidence=_ev, cwe="CWE-601",
+                    owasp="A01:2021 – Broken Access Control",
+                    remediation=REMEDIATION_REDIRECT,
+                    references=["https://owasp.org/www-community/attacks/Unvalidated_Redirects_and_Forwards_Cheat_Sheet"],
+                )
+                _f.set_confidence("CONFIRMED")
+                _f.source = f"{flow.source}({flow.source_id})"
+                _f.sink = flow.sink
+                findings.append(_f)
+    except Exception:
+        pass  # runtime layer is assist-only; never break the core detector
+
     return findings
 
 
