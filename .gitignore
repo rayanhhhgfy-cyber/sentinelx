@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.db
+*.db-journal
+
+# Reports (generated)
+sentinelx-report.html
+sentinelx-report.json
+*.sarif
+
+# Frontend
+web/frontend/node_modules/
+web/frontend/dist/
+web/static/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Env
+.env
