@@ -23,6 +23,7 @@ from sentinelx.modules import xxe, ssti, hostheader, cachepoison, deser
 from sentinelx.modules import ldap, xpath, header_rce, crlf, jsredirect
 from sentinelx.modules import takeover, clickjack, idor_api, jwt_adv, proto_pollute
 from sentinelx.modules import blogic, domxss, apishape
+from sentinelx.modules import nosqli, fileupload, authenum
 
 
 STAGES = [
@@ -326,6 +327,9 @@ async def run_endpoints_slice(ctx: ScanCtx, start_idx: int,
         ("domxss", domxss.scan_endpoint),
         ("sensitive_file", probe.scan_sensitive_file),
         ("exposed_api", probe.scan_exposed_api),
+        ("nosqli", nosqli.scan_endpoint),
+        ("fileupload", fileupload.scan_endpoint),
+        ("authenum", authenum.scan_endpoint),
     ]
     # target-level modules (run once on main URL, not per-endpoint)
     # (defined at module top as TARGET_MODULES)
