@@ -22,7 +22,7 @@ from sentinelx.modules import secrets as secrets_mod, techfp, graphql
 from sentinelx.modules import xxe, ssti, hostheader, cachepoison, deser
 from sentinelx.modules import ldap, xpath, header_rce, crlf, jsredirect
 from sentinelx.modules import takeover, clickjack, idor_api, jwt_adv, proto_pollute
-from sentinelx.modules import blogic, domxss
+from sentinelx.modules import blogic, domxss, apishape
 
 
 STAGES = [
@@ -147,7 +147,9 @@ async def run_stage(ctx: ScanCtx, stage: str):
             {"url": ep.url, "method": ep.method, "params": ep.params,
              "content_type": ep.content_type, "source": ep.source,
              "is_login": ep.is_login, "has_file_upload": ep.has_file_upload,
-             "priority": ep.priority}
+             "priority": ep.priority,
+             "headers": dict(ep.headers), "json_body": dict(ep.json_body),
+             "path_params": list(ep.path_params)}
             for ep in endpoints
         ]
         # JS bundles actually downloaded (for secrets scanning etc.)
@@ -353,6 +355,22 @@ async def run_endpoints_slice(ctx: ScanCtx, start_idx: int,
         for findings in results:
             for f in findings:
                 ctx._emit(f)
+        # API request-shape testing: endpoints reconstructed with full shape
+        # (custom headers / JSON body from the app's own JS) are replayed
+        # verbatim and attacked field-by-field. Validation replay inside
+        # apishape skips dead endpoints so no requests are wasted.
+        try:
+            if (ep.get("json_body") or
+                    any(k.lower() not in ("content-type", "accept")
+                        for k in (ep.get("headers") or {}))):
+                if not ctx._enabled("apishape"):
+                    pass
+                else:
+                    ctx._use("apishape")
+                    for f in await apishape.scan_api_shape(client, config, ep):
+                        ctx._emit(f)
+        except Exception:
+            pass
         # second-order XSS: for params with no reflected XSS, check if a
         # stored payload triggers on OTHER pages (only when smart mode)
         if config.smart and ep["params"]:
