@@ -22,7 +22,7 @@ from sentinelx.modules import secrets as secrets_mod, techfp, graphql
 from sentinelx.modules import xxe, ssti, hostheader, cachepoison, deser
 from sentinelx.modules import ldap, xpath, header_rce, crlf, jsredirect
 from sentinelx.modules import takeover, clickjack, idor_api, jwt_adv, proto_pollute
-from sentinelx.modules import blogic
+from sentinelx.modules import blogic, domxss
 
 
 STAGES = [
@@ -57,6 +57,7 @@ class ScanCtx:
     seen: set = field(default_factory=set)
     seq: int = 0
     endpoints: list = field(default_factory=list)   # list of dicts
+    js_urls: list = field(default_factory=list)    # JS bundles actually downloaded
     findings: list = field(default_factory=list)
     mod_stats: dict = field(default_factory=dict)
     active_module: str = "discovery"
@@ -149,6 +150,12 @@ async def run_stage(ctx: ScanCtx, stage: str):
              "priority": ep.priority}
             for ep in endpoints
         ]
+        # JS bundles actually downloaded (for secrets scanning etc.)
+        ctx.js_urls = sorted(crawler.js_urls)
+        if crawler.storage_keys:
+            ctx._progress(f"discovery: storage keys: {', '.join(sorted(crawler.storage_keys)[:8])}")
+        if crawler.header_names:
+            ctx._progress(f"discovery: custom headers seen in JS: {', '.join(sorted(crawler.header_names)[:8])}")
         if crawler.auth_surfaces:
             ctx._progress(f"discovery: {len(crawler.auth_surfaces)} login form(s) detected (auth surfaces)")
             for a in crawler.auth_surfaces:
@@ -171,7 +178,9 @@ async def run_stage(ctx: ScanCtx, stage: str):
 
     elif stage == "dirfuzz":
         ctx._use("dirfuzz")
-        if ctx._enabled("dirfuzz"):
+        if config.no_wordlist:
+            ctx._progress("probe: directory bruteforce skipped (dynamic discovery only; pass --wordlist to enable guessing)")
+        elif ctx._enabled("dirfuzz"):
             for f in await probe.scan_dirfuzz(client, config, target):
                 ctx._emit(f)
         ctx._progress("probe: directory bruteforce done")
@@ -203,6 +212,16 @@ async def run_stage(ctx: ScanCtx, stage: str):
             if ctx._enabled("secrets"):
                 for f in await secrets_mod.scan_page(client, config, target):
                     ctx._emit(f)
+                # also scan DISCOVERED JS bundles for hardcoded secrets
+                # (dynamic: only URLs the crawler actually downloaded, never guessed)
+                for js_url in (ctx.js_urls or [])[:25]:
+                    if js_url == target:
+                        continue
+                    try:
+                        for f in await secrets_mod.scan_page(client, config, js_url):
+                            ctx._emit(f)
+                    except Exception:
+                        pass
             ctx._use("techfp")
             if ctx._enabled("techfp"):
                 for f in await techfp.fingerprint(client, config, target):
@@ -302,6 +321,9 @@ async def run_endpoints_slice(ctx: ScanCtx, start_idx: int,
         ("jwt_adv", jwt_adv.scan_endpoint),
         ("proto_pollute", proto_pollute.scan_endpoint),
         ("blogic", blogic.scan_endpoint),
+        ("domxss", domxss.scan_endpoint),
+        ("sensitive_file", probe.scan_sensitive_file),
+        ("exposed_api", probe.scan_exposed_api),
     ]
     # target-level modules (run once on main URL, not per-endpoint)
     # (defined at module top as TARGET_MODULES)
@@ -319,10 +341,14 @@ async def run_endpoints_slice(ctx: ScanCtx, start_idx: int,
         # pre-fetch shared baseline once per endpoint (modules reuse it)
         if ep["params"]:
             await ctx.get_baseline(ep["method"], ep["url"], ep["params"])
+        # Param-less pages (source=crawl-page): only run page-content modules
+        # (NEEDS_PARAMS=False, e.g. domxss). Param-testers need params to test.
+        mods = [(n, fn) for n, fn in MODULES
+                if ep["params"] or not getattr(fn, "NEEDS_PARAMS", True)]
         # run all modules concurrently — the client's semaphore bounds
         # actual HTTP concurrency at config.concurrency
         results = await asyncio.gather(*[
-            run_mod(name, fn, ep) for name, fn in MODULES
+            run_mod(name, fn, ep) for name, fn in mods
         ])
         for findings in results:
             for f in findings:

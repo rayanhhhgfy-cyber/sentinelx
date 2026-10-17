@@ -38,6 +38,7 @@ class ScanConfig:
     modules: list = field(default_factory=list)
     max_pages: int = 50  # crawler page limit
     smart: bool = True  # smart mode: tech-tuned payloads, priority queue, correlation
+    no_wordlist: bool = True  # DEFAULT: pure dynamic discovery; wordlists only via --wordlist
     tech_stack: set = field(default_factory=set)  # populated by techfp: {"PHP", "Flask", ...}
     # web-UI extensions (all optional, safe defaults)
     custom_headers: dict = field(default_factory=dict)
