@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SentinelX — Find web vulnerabilities before attackers do</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l8 3v6c0 5-3.5 9.3-8 11-4.5-1.7-8-6-8-11V5l8-3z"/><path d="M9 12l2 2 4-4"/></svg><span>SentinelX</span></a>
+    <nav class="nav">
+      <a href="index.html" class="active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg><span>Home</span></a>
+      <a href="overview.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span>Overview</span></a>
+      <a href="dashboard.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><line x1="12" y1="1" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="23"/><line x1="1" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="23" y2="12"/></svg><span>Scan</span></a>
+      <a href="history.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg><span>History</span></a>
+      <a href="settings.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Settings</span></a>
+    </nav>
+    <div class="nav-right">
+      <a href="shots.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg><span>Shots</span></a>
+      <a href="login.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg><span>Logout</span></a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap-wide">
+  <div class="hero">
+    <div>
+      <h1>Find web vulnerabilities<br>before attackers do.</h1>
+      <p class="sub">SentinelX is a real, working vulnerability scanner. Nineteen modules probe every endpoint, and each finding carries raw evidence, CVSS scoring, and a one-click reproducer.</p>
+      <div class="actions">
+        <a class="btn btn-primary btn-hero" href="dashboard.html">Start a scan</a>
+        <a class="btn btn-secondary btn-hero" href="history.html">View history</a>
+      </div>
+    </div>
+    <div class="preview">
+      <div class="preview-head"><span>Findings (7)</span><a href="findings.html">View all &rarr;</a></div>
+      <div class="preview-row">
+        <span class="dot dot-medium"></span>
+        <div class="row-main">
+          <div class="row-title">Security Misconfiguration <span class="mono">missing-header:strict-transport-security</span></div>
+          <div class="row-meta">GET <span class="mono">http://127.0.0.1:5055</span> &middot; CVSS 4.8</div>
+        </div>
+      </div>
+      <div class="preview-row">
+        <span class="dot dot-medium"></span>
+        <div class="row-main">
+          <div class="row-title">Security Misconfiguration <span class="mono">missing-header:content-security-policy</span></div>
+          <div class="row-meta">GET <span class="mono">http://127.0.0.1:5055</span> &middot; CVSS 4.2</div>
+        </div>
+      </div>
+      <div class="preview-row">
+        <span class="dot dot-low"></span>
+        <div class="row-main">
+          <div class="row-title">Security Misconfiguration <span class="mono">missing-header:x-content-type-options</span></div>
+          <div class="row-meta">GET <span class="mono">http://127.0.0.1:5055</span> &middot; CVSS 3.1</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="hero-stats">
+    <div class="stat">
+      <div class="stat-label">Detection modules</div>
+      <div class="stat-num">19</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Encoding transforms</div>
+      <div class="stat-num">31</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">WAF fingerprints</div>
+      <div class="stat-num">25</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">False positives</div>
+      <div class="stat-num">0</div>
+      <div class="form-note">on hardened reference target</div>
+    </div>
+  </div>
+</main>
+
+<footer class="footer">
+  <div class="wrap-wide">
+    <span>SentinelX — a real, working vulnerability scanner.</span>
+    <span>Only scan targets you own or are authorised to test.</span>
+  </div>
+</footer>
+<script src="assets/app.js"></script>
+</body>
+</html>
